@@ -142,6 +142,15 @@ impl core::fmt::Display for DerError {
 }
 impl std::error::Error for DerError {}
 
+/// Parse `der` as exactly one element of tag `tag`, returning its content and
+/// requiring that nothing trails. A convenience over [`Der::expect`] + [`Der::finish`].
+pub fn one_or(der: &[u8], tag: u8) -> Result<&[u8], DerError> {
+    let mut r = Der::new(der);
+    let content = r.expect(tag)?;
+    r.finish()?;
+    Ok(content)
+}
+
 /// A cursor over a DER buffer. Borrows the input; returned slices are sub-borrows.
 pub struct Der<'a> {
     buf: &'a [u8],

@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod crypto;
 pub mod der;
 pub mod messages;
