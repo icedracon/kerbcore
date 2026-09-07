@@ -4,9 +4,12 @@
 //! [`crate::rfc8009`] (keys) to [`crate::messages`] (wire) into a real Kerberos
 //! AS handshake — the last layer before `kerbcore` can replace `picky-krb`.
 
-use crate::der::{context_tag, encode_sequence, explicit, one_or, Der, DerError, TAG_SEQUENCE};
-use crate::messages::{KdcReq, KdcReqBody};
-use crate::types::{EncryptedData, KerberosTime, PaData, PrincipalName};
+use crate::der::{
+    application_tag, context_tag, encode_integer, encode_sequence, explicit, one_or, tlv, Der,
+    DerError, TAG_BIT_STRING, TAG_SEQUENCE,
+};
+use crate::messages::{KdcReq, KdcReqBody, Ticket};
+use crate::types::{encode_realm, Checksum, EncryptedData, KerberosTime, PaData, PrincipalName};
 
 /// RFC 4120 §7.5.1 key usage — AS-REQ PA-ENC-TIMESTAMP padata.
 pub const KU_AS_REQ_PA_ENC_TS: u32 = 1;
@@ -162,6 +165,115 @@ pub fn pa_enc_timestamp(enc: &EncryptedData) -> PaData {
         padata_type: PA_ENC_TIMESTAMP,
         padata_value: enc.encode(),
     }
+}
+
+// ── TGS exchange ────────────────────────────────────────────────────────────
+
+/// Key usage — TGS-REQ authenticator checksum (over the KDC-REQ-BODY).
+pub const KU_TGS_REQ_AUTH_CKSUM: u32 = 6;
+/// Key usage — TGS-REQ authenticator encryption (under the TGT session key).
+pub const KU_TGS_REQ_AUTH: u32 = 7;
+/// Key usage — TGS-REP enc-part (under the TGT session key).
+pub const KU_TGS_REP_ENC_PART: u32 = 8;
+/// PA-DATA type for PA-TGS-REQ (an AP-REQ carried as pre-auth).
+pub const PA_TGS_REQ: i32 = 1;
+/// Checksum type hmac-sha1-96-aes256 (RFC 3962).
+pub const CKSUM_HMAC_SHA1_96_AES256: i32 = 16;
+
+/// `hmac-sha1-96-aes256` checksum: HMAC-SHA1-96 keyed by `Kc = DK(key, usage||0x99)`.
+fn aes_checksum(key: &[u8], usage: u32, data: &[u8]) -> Vec<u8> {
+    crate::crypto::hmac_sha1_96(&crate::crypto::derive_kc(key, usage), data).to_vec()
+}
+
+/// `Authenticator ::= [APPLICATION 2] SEQUENCE { … }` (the pieces a TGS-REQ needs).
+fn encode_authenticator(
+    crealm: &str,
+    cname: &PrincipalName,
+    cusec: i32,
+    ctime: &str,
+    cksum: Option<&Checksum>,
+) -> Vec<u8> {
+    let mut body = explicit(0, &encode_integer(5)); // authenticator-vno
+    body.extend_from_slice(&explicit(1, &encode_realm(crealm)));
+    body.extend_from_slice(&explicit(2, &cname.encode()));
+    if let Some(c) = cksum {
+        body.extend_from_slice(&explicit(3, &c.encode()));
+    }
+    body.extend_from_slice(&explicit(4, &encode_integer(cusec as i64)));
+    body.extend_from_slice(&explicit(5, &KerberosTime(ctime.to_string()).encode()));
+    tlv(application_tag(2), &encode_sequence(&body))
+}
+
+/// `AP-REQ ::= [APPLICATION 14] SEQUENCE { pvno [0], msg-type [1], ap-options [2],
+/// ticket [3] Ticket, authenticator [4] EncryptedData }`.
+fn encode_ap_req(ticket_der: &[u8], enc_auth: &EncryptedData) -> Vec<u8> {
+    let ap_options = tlv(TAG_BIT_STRING, &[0x00, 0, 0, 0, 0]); // no options set
+    let body = [
+        explicit(0, &encode_integer(5)),
+        explicit(1, &encode_integer(14)),
+        explicit(2, &ap_options),
+        explicit(3, ticket_der),
+        explicit(4, &enc_auth.encode()),
+    ]
+    .concat();
+    tlv(application_tag(14), &encode_sequence(&body))
+}
+
+/// Build a TGS-REQ for `sname`, authenticated by `tgt` + `tgt_session_key` (from the
+/// AS exchange). The authenticator's checksum covers the KDC-REQ-BODY (usage 6) and
+/// the authenticator itself is encrypted under the TGT session key (usage 7).
+#[allow(clippy::too_many_arguments)]
+pub fn build_tgs_req(
+    realm: &str,
+    sname: &PrincipalName,
+    tgt: &Ticket,
+    tgt_session_key: &[u8],
+    crealm: &str,
+    cname: &PrincipalName,
+    nonce: u32,
+    till: &str,
+    etypes: &[i32],
+    ctime: &str,
+    cusec: i32,
+) -> Vec<u8> {
+    // TGS-REQ omits cname in the body (identity comes from the ticket).
+    let body = KdcReqBody {
+        kdc_options: 0x4081_0000,
+        cname: None,
+        realm: realm.to_string(),
+        sname: Some(sname.clone()),
+        from: None,
+        till: KerberosTime(till.to_string()),
+        rtime: None,
+        nonce,
+        etypes: etypes.to_vec(),
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    };
+    let body_der = body.encode();
+    let cksum = Checksum {
+        cksumtype: CKSUM_HMAC_SHA1_96_AES256,
+        checksum: aes_checksum(tgt_session_key, KU_TGS_REQ_AUTH_CKSUM, &body_der),
+    };
+    let auth = encode_authenticator(crealm, cname, cusec, ctime, Some(&cksum));
+    let conf: [u8; 16] = std::array::from_fn(|i| 0x5a ^ i as u8);
+    let enc_auth = EncryptedData {
+        etype: 18,
+        kvno: None,
+        cipher: crate::crypto::encrypt_message(tgt_session_key, KU_TGS_REQ_AUTH, &conf, &auth),
+    };
+    let ap_req = encode_ap_req(&tgt.encode(), &enc_auth);
+    let padata = vec![PaData {
+        padata_type: PA_TGS_REQ,
+        padata_value: ap_req,
+    }];
+    KdcReq {
+        msg_type: 12,
+        padata,
+        req_body: body,
+    }
+    .encode()
 }
 
 #[cfg(test)]

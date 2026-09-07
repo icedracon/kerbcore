@@ -20,9 +20,9 @@ use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kerbcore::client::{
-    build_as_req, client_cname, enc_kdc_rep_part_session_key, encode_pa_enc_ts_enc,
-    pa_enc_timestamp, parse_etype_info2, unix_to_kerberos_time, KU_AS_REP_ENC_PART,
-    KU_AS_REQ_PA_ENC_TS, PA_ETYPE_INFO2,
+    build_as_req, build_tgs_req, client_cname, enc_kdc_rep_part_session_key, encode_pa_enc_ts_enc,
+    krbtgt_sname, pa_enc_timestamp, parse_etype_info2, unix_to_kerberos_time, KU_AS_REP_ENC_PART,
+    KU_AS_REQ_PA_ENC_TS, KU_TGS_REP_ENC_PART, PA_ETYPE_INFO2,
 };
 use kerbcore::crypto::{decrypt_message, encrypt_message, string_to_key};
 use kerbcore::messages::{KdcRep, KrbError};
@@ -33,7 +33,9 @@ const AES256: i32 = 18;
 /// Kerberos-over-TCP: 4-byte big-endian length prefix + message; same framing back.
 fn kdc_exchange(target: &str, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(target).expect("connect KDC");
-    stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
     let mut framed = (request.len() as u32).to_be_bytes().to_vec();
     framed.extend_from_slice(request);
     stream.write_all(&framed).expect("send AS-REQ");
@@ -46,7 +48,10 @@ fn kdc_exchange(target: &str, request: &[u8]) -> Vec<u8> {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// Parse a KRB-ERROR's e-data (`METHOD-DATA ::= SEQUENCE OF PA-DATA`) and return the
@@ -83,15 +88,30 @@ fn live_as_exchange() {
             return;
         }
     };
-    let target = if kdc.contains(':') { kdc.clone() } else { format!("{kdc}:88") };
+    let target = if kdc.contains(':') {
+        kdc.clone()
+    } else {
+        format!("{kdc}:88")
+    };
     let cname = client_cname(&user);
     let till = unix_to_kerberos_time(now_secs() + 6 * 3600);
 
     // ── Stage 1: no-pre-auth AS-REQ → expect KRB-ERROR(25) + salt ────────
-    let req1 = build_as_req(&realm, &cname, 0x1111_2222, &till, &[AES256, 17, 23], vec![]);
+    let req1 = build_as_req(
+        &realm,
+        &cname,
+        0x1111_2222,
+        &till,
+        &[AES256, 17, 23],
+        vec![],
+    );
     let resp1 = kdc_exchange(&target, &req1);
-    let err = KrbError::decode(&resp1)
-        .unwrap_or_else(|e| panic!("stage 1: expected KRB-ERROR, got {e:?} ({} bytes)", resp1.len()));
+    let err = KrbError::decode(&resp1).unwrap_or_else(|e| {
+        panic!(
+            "stage 1: expected KRB-ERROR, got {e:?} ({} bytes)",
+            resp1.len()
+        )
+    });
     eprintln!(
         "stage 1 OK — KDC returned KRB-ERROR code {} (sname {:?}) from realm {}",
         err.error_code, err.sname.name_string, err.realm
@@ -109,7 +129,11 @@ fn live_as_exchange() {
     let ts = encode_pa_enc_ts_enc(&unix_to_kerberos_time(now_secs()), 0);
     let conf: [u8; 16] = std::array::from_fn(|i| (now_secs() as u8).wrapping_add(i as u8));
     let ts_cipher = encrypt_message(&key, KU_AS_REQ_PA_ENC_TS, &conf, &ts);
-    let enc = EncryptedData { etype: AES256, kvno: None, cipher: ts_cipher };
+    let enc = EncryptedData {
+        etype: AES256,
+        kvno: None,
+        cipher: ts_cipher,
+    };
     let req2 = build_as_req(
         &realm,
         &cname,
@@ -121,7 +145,10 @@ fn live_as_exchange() {
     let resp2 = kdc_exchange(&target, &req2);
 
     if let Ok(e) = KrbError::decode(&resp2) {
-        panic!("stage 2: KDC rejected pre-auth with KRB-ERROR code {} (salt/iter/clock?)", e.error_code);
+        panic!(
+            "stage 2: KDC rejected pre-auth with KRB-ERROR code {} (salt/iter/clock?)",
+            e.error_code
+        );
     }
     let rep = KdcRep::decode(&resp2).expect("stage 2: expected AS-REP");
     eprintln!(
@@ -141,4 +168,34 @@ fn live_as_exchange() {
     );
     assert_eq!(session_key.keytype, AES256);
     assert_eq!(session_key.keyvalue.len(), 32);
+
+    // ── Stage 3: TGS-REQ (AP-REQ w/ the TGT) → TGS-REP → service session key ─
+    let tgs = build_tgs_req(
+        &realm,
+        &krbtgt_sname(&realm), // ask for a ticket to the TGS itself (always valid)
+        &rep.ticket,
+        &session_key.keyvalue,
+        &realm,
+        &cname,
+        0x5555_6666,
+        &till,
+        &[AES256],
+        &unix_to_kerberos_time(now_secs()),
+        0,
+    );
+    let resp3 = kdc_exchange(&target, &tgs);
+    if let Ok(e) = KrbError::decode(&resp3) {
+        panic!("stage 3: TGS-REQ rejected with KRB-ERROR code {}", e.error_code);
+    }
+    let tgs_rep = KdcRep::decode(&resp3).expect("stage 3: expected TGS-REP");
+    assert_eq!(tgs_rep.msg_type, 13);
+    // Decrypt the TGS-REP enc-part with the TGT session key at usage 8.
+    let tgs_plain = decrypt_message(&session_key.keyvalue, KU_TGS_REP_ENC_PART, &tgs_rep.enc_part.cipher)
+        .expect("stage 3: decrypt TGS-REP enc-part");
+    let svc_key = enc_kdc_rep_part_session_key(&tgs_plain).expect("parse EncTGSRepPart session key");
+    eprintln!(
+        "stage 3 OK — TGS-REP; service ticket for {:?}, service session key etype {} ({} bytes). FULL AS+TGS EXCHANGE VALIDATED.",
+        tgs_rep.ticket.sname.name_string, svc_key.keytype, svc_key.keyvalue.len()
+    );
+    assert_eq!(svc_key.keyvalue.len(), 32);
 }
