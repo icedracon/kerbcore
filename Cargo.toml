@@ -28,7 +28,9 @@ md-5 = "0.10"
 sha2 = "0.10"
 
 [dev-dependencies]
-# Differential oracle: kerbcore's RC4-HMAC must match our live-DC-validated
-# ms-pac-forge implementation byte-for-byte. Dev-only — NEVER a runtime dep
-# (the whole point of kerbcore is to remove external crypto deps).
+# Differential oracles — dev-only, NEVER runtime deps (the whole point of
+# kerbcore is to remove these). ms-pac-forge validates RC4-HMAC; picky-krb (the
+# library kerbcore replaces) validates the DER message codec byte-for-byte.
 ms-pac-forge = "0.1.3"
+picky-krb = "0.9"
+picky-asn1-der = "0.5"

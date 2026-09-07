@@ -576,6 +576,54 @@ mod tests {
         assert_eq!(KdcReqBody::decode(&body.encode()).unwrap(), body);
     }
 
+    // ── DIFFERENTIAL vs picky-krb (the library kerbcore replaces) ────────
+    // kerbcore DER → picky-krb strict decode → picky-krb re-encode → must be
+    // byte-identical. picky-krb is a dev-dependency only. This proves the wire
+    // format, which self-consistent round-trips cannot.
+    #[test]
+    fn ticket_der_matches_picky_krb() {
+        let der = sample_ticket().encode();
+        let pk: picky_krb::data_types::Ticket =
+            picky_asn1_der::from_bytes(&der).expect("picky-krb parses kerbcore Ticket DER");
+        let reencoded = picky_asn1_der::to_vec(&pk).expect("picky-krb re-encodes");
+        assert_eq!(reencoded, der, "Ticket DER diverges from picky-krb");
+    }
+
+    #[test]
+    fn krb_error_der_matches_picky_krb() {
+        let err = KrbError {
+            stime: KerberosTime("20240102030405Z".into()),
+            susec: 123456,
+            error_code: 25,
+            realm: "EXAMPLE.COM".into(),
+            sname: sample_svc(),
+            e_text: Some("NEEDED_PREAUTH".into()),
+            e_data: Some(vec![0x30, 0x05, 0x02, 0x01, 0x01]),
+        };
+        let der = err.encode();
+        let pk: picky_krb::messages::KrbError =
+            picky_asn1_der::from_bytes(&der).expect("picky-krb parses kerbcore KRB-ERROR DER");
+        let reencoded = picky_asn1_der::to_vec(&pk).expect("picky-krb re-encodes");
+        assert_eq!(reencoded, der, "KRB-ERROR DER diverges from picky-krb");
+    }
+
+    #[test]
+    fn as_rep_der_matches_picky_krb() {
+        let rep = KdcRep {
+            msg_type: 11,
+            padata: vec![],
+            crealm: "EXAMPLE.COM".into(),
+            cname: sample_princ(),
+            ticket: sample_ticket(),
+            enc_part: EncryptedData { etype: 18, kvno: None, cipher: vec![1, 2, 3] },
+        };
+        let der = rep.encode();
+        let pk: picky_krb::messages::AsRep =
+            picky_asn1_der::from_bytes(&der).expect("picky-krb parses kerbcore AS-REP DER");
+        let reencoded = picky_asn1_der::to_vec(&pk).expect("picky-krb re-encodes");
+        assert_eq!(reencoded, der, "AS-REP DER diverges from picky-krb");
+    }
+
     #[test]
     fn messages_reject_garbage_without_panic() {
         for bad in [&[][..], &[0x6a, 0x02, 0x30, 0x00][..], &[0xff][..]] {

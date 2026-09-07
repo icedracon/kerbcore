@@ -2,13 +2,30 @@
 
 Pure-Rust Kerberos building blocks — **no FFI, no dependency on a host krb5**.
 
-> **Spike status (1.5.1).** Local, unpublished (`publish = false`). This first cut
-> ships only the RFC 3961 / RFC 3962 crypto for the `aes256-cts-hmac-sha1-96`
-> profile (etype 18). The ASN.1 message codec and an AS/TGS client land next (1.6),
-> at which point `kerbcore` replaces `picky-krb` inside ADhammer's Kerberos stack.
-> Ship-target version when frozen: `0.1.0-beta.1`.
+> **Status (1.5.1).** Local, unpublished (`publish = false`). Two layers are done:
+> the full modern **etype crypto matrix** (+ string-to-key) and a from-scratch
+> **DER + RFC 4120 message codec**, the latter verified byte-identical to
+> `picky-krb`. An AS/TGS **client** lands next (1.6), at which point `kerbcore`
+> replaces `picky-krb` inside ADhammer's Kerberos stack. Ship-target: `0.1.0-beta.1`.
 
-## What it does today
+## ASN.1 / RFC 4120 message codec
+
+A hand-rolled DER (X.690) codec — **no external ASN.1 crate** — with a **total,
+no-panic decoder** (every malformed KDC/attacker byte returns `DerError`, never
+crashes). Types and messages:
+
+- `der` — canonical DER encoder + total decoder (KAT'd integer/length encodings).
+- `types` — `PrincipalName`, `KerberosTime`, `EncryptionKey`, `EncryptedData`,
+  `PaData`, `Checksum`, `Realm`.
+- `messages` — `Ticket` `[APP 1]`, `KDC-REQ` (AS-REQ / TGS-REQ), `KDC-REP`
+  (AS-REP / TGS-REP), `KRB-ERROR` `[APP 30]`.
+
+**Wire conformance:** every message round-trips, its application/context tags are
+hand-verified, and — the real proof — `Ticket`, `AS-REP`, and `KRB-ERROR` encode
+**byte-identically to `picky-krb`** (kerbcore DER → picky-krb strict decode →
+re-encode → same bytes). `picky-krb` is a dev-dependency only.
+
+## What it does today (crypto)
 
 The RFC 3961 / RFC 3962 primitive set, key-length-generic across the AES-SHA1 profiles:
 
@@ -54,7 +71,7 @@ Known-answer tested, not just round-tripped:
 > lifted AES-CTS (the last-two-block swap was skipped for exact-multiple inputs) — a case
 > the never-closed sealer's round-trip tests could not catch.
 
-`cargo test` → 32 passing.
+`cargo test` → 55 passing (crypto + DER/message codec).
 
 ## Dependencies
 
