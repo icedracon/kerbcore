@@ -1,2 +1,3 @@
 target/
 Cargo.lock
+.githooks/leak-terms.local.txt

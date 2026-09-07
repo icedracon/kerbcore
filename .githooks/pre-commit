@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Redaction guard — block a commit whose staged ADDED lines carry lab identifiers.
+# kerbcore is public; its source is env-driven (no creds), but this stops an
+# accidental IP / hostname / hash / SID from a testing session reaching the tree.
+# Bypass (rare, legit): ADHAMMER_ALLOW_IDENTIFIERS=1 git commit ...
+set -euo pipefail
+
+if [ "${ADHAMMER_ALLOW_IDENTIFIERS:-0}" = "1" ]; then
+  echo "pre-commit: redaction check bypassed via ADHAMMER_ALLOW_IDENTIFIERS=1" >&2
+  exit 0
+fi
+
+ROOT=$(git rev-parse --show-toplevel)
+TERMS_FILE="$ROOT/.githooks/leak-terms.txt"
+LOCAL_TERMS_FILE="$ROOT/.githooks/leak-terms.local.txt" # untracked, gitignored literal secrets
+[ -s "$TERMS_FILE" ] || { echo "pre-commit BLOCKED: $TERMS_FILE missing/empty." >&2; exit 1; }
+
+SKIP=':(exclude).githooks/pre-commit :(exclude).githooks/leak-terms.txt :(exclude).githooks/leak-terms.local.txt'
+TERMS=$(mktemp); ADDED=$(mktemp)
+trap 'rm -f "$TERMS" "$ADDED"' EXIT
+cat "$TERMS_FILE" > "$TERMS"
+[ -s "$LOCAL_TERMS_FILE" ] && cat "$LOCAL_TERMS_FILE" >> "$TERMS"
+
+git diff --cached --unified=0 -- . $SKIP | awk '/^\+\+\+ /{next} /^\+/{print substr($0,2)}' > "$ADDED"
+
+if hits=$(grep -inE -f "$TERMS" "$ADDED"); then
+  echo "======================================================================" >&2
+  echo " pre-commit BLOCKED: staged diff contains a lab identifier." >&2
+  printf '%s\n' "$hits" | head -20 >&2
+  echo " Redact before committing, or ADHAMMER_ALLOW_IDENTIFIERS=1 for a false positive." >&2
+  exit 1
+fi
+exit 0
