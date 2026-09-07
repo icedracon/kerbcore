@@ -159,6 +159,11 @@ impl<'a> Der<'a> {
         self.pos >= self.buf.len()
     }
 
+    /// The tag of the next element without consuming it — for OPTIONAL fields.
+    pub fn peek_tag(&self) -> Option<u8> {
+        self.buf.get(self.pos).copied()
+    }
+
     /// Error unless the buffer is fully consumed — call after a top-level parse.
     pub fn finish(&self) -> Result<(), DerError> {
         if self.is_empty() {
