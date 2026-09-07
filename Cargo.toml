@@ -24,6 +24,8 @@ sha1 = "0.10"
 # etype 23 (RC4-HMAC): NT-hash string-to-key + HMAC-MD5. RC4 itself is hand-rolled.
 md4 = "0.10"
 md-5 = "0.10"
+# etypes 19/20 (RFC 8009 AES-SHA2): SP800-108 KDF + HMAC-SHA-256/384.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Differential oracle: kerbcore's RC4-HMAC must match our live-DC-validated

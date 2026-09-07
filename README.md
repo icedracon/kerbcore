@@ -28,33 +28,39 @@ A complete AD Kerberos crypto crate owns the whole etype matrix — not one prof
 |------:|---------|--------|
 | **17** | aes128-cts-hmac-sha1-96 | ✅ implemented |
 | **18** | aes256-cts-hmac-sha1-96 | ✅ implemented |
-| **19** | aes128-cts-hmac-sha256-128 (RFC 8009) | ⏳ next — SP800-108 KDF + SHA-256 |
-| **20** | aes256-cts-hmac-sha384-192 (RFC 8009) | ⏳ next — SP800-108 KDF + SHA-384 |
-| **23** | rc4-hmac (RFC 4757) | ⏳ next — RC4 + HMAC-MD5 + MD4(NT-hash) |
+| **19** | aes128-cts-hmac-sha256-128 (RFC 8009) | ✅ implemented — RFC 8009 §7 KAT |
+| **20** | aes256-cts-hmac-sha384-192 (RFC 8009) | ✅ implemented — RFC 8009 §7 KAT |
+| **23** | rc4-hmac (RFC 4757) | ✅ implemented — differential vs reference |
 | 1 / 3 | des-cbc-* | ✂ out of scope — dead in AD, no weak crypto shipped |
 
-etypes 19/20 (AES-SHA2) are the point of the crate: almost no Rust library implements
-RFC 8009 from scratch, and Windows Server 2022+ negotiates them.
+The full modern AD etype matrix — including RFC 8009 (etypes 19/20), which almost no
+Rust library implements from scratch and which Windows Server 2022+ negotiates.
 
 ## Conformance
 
 Known-answer tested, not just round-tripped:
 
 - `nfold("012345", 64) == 0xbe072631276b1955` (RFC 3961 §5.2 worked example)
-- HMAC-SHA1 against RFC 2202 test case 1
+- HMAC-SHA1 vs RFC 2202; HMAC-MD5 vs RFC 2202; NT-hash + RC4 vs canonical vectors
 - DR/DK determinism + AES `random_to_key = identity`
-- AES-128 and AES-256 CTS round-trips across the edge lengths (16 / 17 / 31 / 32 / 47 / 48 / 64 B)
-- encrypt-then-MAC round-trip + tamper / wrong-usage / truncation rejection (both key sizes)
-- unsupported key length (e.g. AES-192) panics loudly rather than mis-deriving
+- AES-128/256 CTS round-trips across the edge lengths (16 / 17 / 31 / 32 / 47 / 48 / 64 B)
+- **RFC 8009 §7 vectors** — Kc/Ke/Ki derivation + all four sample encryptions, both etypes
+- **RC4-HMAC** — byte-exact differential vs the live-DC-validated `ms-pac-forge` reference
+  (dev-dependency only), across 8 key-usages × 7 lengths
+- encrypt-then-MAC / checksum-verify round-trip + tamper / wrong-usage / truncation rejection
+- unsupported AES key length (e.g. AES-192) panics loudly rather than mis-deriving
 
-Per-etype known-answer vectors come from RFC 3962 App B (17/18), RFC 8009 App A
-(19/20), and RFC 4757 / MS-KILE (23) as each profile lands.
+> Note: implementing the RFC 8009 §7 KAT surfaced and fixed a latent CBC-CS3 bug in the
+> lifted AES-CTS (the last-two-block swap was skipped for exact-multiple inputs) — a case
+> the never-closed sealer's round-trip tests could not catch.
 
-`cargo test` → 22 passing.
+`cargo test` → 32 passing.
 
 ## Dependencies
 
-`aes`, `hmac`, `sha1` (RustCrypto). No FFI, no system krb5, `#![forbid(unsafe_code)]`.
+`aes`, `hmac`, `sha1`, `sha2`, `md4`, `md-5` (RustCrypto); RC4 is hand-rolled. No FFI, no
+system krb5, `#![forbid(unsafe_code)]`. (`ms-pac-forge` is a **dev**-dependency only, used
+as the RC4-HMAC differential oracle — never a runtime dep.)
 
 ## Scope
 

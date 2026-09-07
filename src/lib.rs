@@ -20,5 +20,6 @@
 
 pub mod crypto;
 pub mod rc4;
+pub mod rfc8009;
 
 pub use crypto::*;

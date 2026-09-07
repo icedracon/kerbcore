@@ -205,7 +205,15 @@ pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; AES_BLOCK_LEN], plaintext: &[u8]) -
     }
 
     if remainder == 0 {
-        // Exact multiple (including exactly one block) — output is plain CBC.
+        // CS3 (RFC 3962 / RFC 8009): for an exact multiple of MORE than one block,
+        // the last two ciphertext blocks are swapped. Exactly one block has nothing
+        // to swap. (Verified byte-exact against RFC 8009 §7's 2-block vector.)
+        if full_blocks >= 2 {
+            let m = cbc_out.len();
+            for k in 0..AES_BLOCK_LEN {
+                cbc_out.swap(m - 2 * AES_BLOCK_LEN + k, m - AES_BLOCK_LEN + k);
+            }
+        }
         return cbc_out;
     }
 
@@ -245,12 +253,19 @@ pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; AES_BLOCK_LEN], ciphertext: &[u8]) 
     let remainder = n % AES_BLOCK_LEN;
 
     if remainder == 0 {
-        // Exact multiple (including exactly one block) — plain CBC decrypt.
+        // CS3: undo the last-two-block swap (only for >1 block) before plain CBC decrypt.
+        let mut ct = ciphertext.to_vec();
+        if full_blocks >= 2 {
+            let m = ct.len();
+            for k in 0..AES_BLOCK_LEN {
+                ct.swap(m - 2 * AES_BLOCK_LEN + k, m - AES_BLOCK_LEN + k);
+            }
+        }
         let mut out = Vec::with_capacity(n);
         let mut prev = *iv;
         for i in 0..full_blocks {
             let mut b = aes::cipher::generic_array::GenericArray::clone_from_slice(
-                &ciphertext[i * AES_BLOCK_LEN..(i + 1) * AES_BLOCK_LEN],
+                &ct[i * AES_BLOCK_LEN..(i + 1) * AES_BLOCK_LEN],
             );
             let saved: [u8; AES_BLOCK_LEN] = b.as_slice().try_into().expect("block-sized");
             cipher.decrypt_block(&mut b);
