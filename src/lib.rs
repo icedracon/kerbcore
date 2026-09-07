@@ -20,6 +20,7 @@
 
 pub mod crypto;
 pub mod der;
+pub mod messages;
 pub mod rc4;
 pub mod rfc8009;
 pub mod types;
