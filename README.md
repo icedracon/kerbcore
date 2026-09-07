@@ -2,11 +2,22 @@
 
 Pure-Rust Kerberos building blocks — **no FFI, no dependency on a host krb5**.
 
-> **Status (1.5.1).** Local, unpublished (`publish = false`). Two layers are done:
-> the full modern **etype crypto matrix** (+ string-to-key) and a from-scratch
-> **DER + RFC 4120 message codec**, the latter verified byte-identical to
-> `picky-krb`. An AS/TGS **client** lands next (1.6), at which point `kerbcore`
-> replaces `picky-krb` inside ADhammer's Kerberos stack. Ship-target: `0.1.0-beta.1`.
+> **Status (1.5.1).** Local, unpublished (`publish = false`). Three layers are done
+> and cross-checked: the full modern **etype crypto matrix** (+ string-to-key), a
+> from-scratch **DER + RFC 4120 message codec** (byte-identical to `picky-krb`), and
+> an **AS + TGS client**. The client is **live-validated end-to-end against Windows
+> Server 2019, 2022, and 2025 KDCs** — it obtains real TGTs and service tickets from
+> each (three different salt schemes, all handled). Ship-target: `0.1.0-beta.1`.
+
+## Live validation
+
+The AS and TGS exchanges are exercised against real domain controllers by an
+**env-gated** integration test (`tests/live_kdc.rs`) — it no-ops without creds, so
+`cargo test`/CI stay offline and **no credentials or lab identifiers live in the
+source**. Against Server 2019 / 2022 / 2025 it: sends an AS-REQ the KDC accepts,
+decodes the `KRB-ERROR` + `ETYPE-INFO2` salt, derives the key, gets an AS-REP and
+decrypts the session key, then builds an AP-REQ (authenticator + req-body checksum)
+in a TGS-REQ and decrypts the resulting service ticket's session key.
 
 ## ASN.1 / RFC 4120 message codec
 
