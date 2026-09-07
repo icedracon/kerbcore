@@ -10,15 +10,31 @@ Pure-Rust Kerberos building blocks — **no FFI, no dependency on a host krb5**.
 
 ## What it does today
 
-RFC 3961 / RFC 3962 primitives for the AES profile every modern AD KDC negotiates:
+The RFC 3961 / RFC 3962 primitive set, key-length-generic across the AES-SHA1 profiles:
 
 - `nfold` — RFC 3961 §5.2 n-fold
-- `aes_cts_encrypt` / `aes_cts_decrypt` — RFC 3962 §5 AES CBC-CTS (CS3)
-- `dr` / `dk` — RFC 3961 §5.1 DR/DK derivation (AES-256)
+- `aes_cts_encrypt` / `aes_cts_decrypt` — RFC 3962 §5 AES CBC-CTS (CS3), AES-128 **and** AES-256
+- `dr` / `dk` — RFC 3961 §5.1 DR/DK derivation (output = base key length)
 - `hmac_sha1_96` — RFC 2104 HMAC-SHA1 truncated to 96 bits
 - `derive_kc` / `derive_ke` / `derive_ki` — RFC 3961 §5.3 subkey derivation
 - `encrypt_message` / `decrypt_message` — the generic encrypt-then-MAC primitive
   that KILE `EncryptedData` and GSS-API wrap-tokens compose out of
+
+## Encryption-type coverage
+
+A complete AD Kerberos crypto crate owns the whole etype matrix — not one profile:
+
+| etype | profile | status |
+|------:|---------|--------|
+| **17** | aes128-cts-hmac-sha1-96 | ✅ implemented |
+| **18** | aes256-cts-hmac-sha1-96 | ✅ implemented |
+| **19** | aes128-cts-hmac-sha256-128 (RFC 8009) | ⏳ next — SP800-108 KDF + SHA-256 |
+| **20** | aes256-cts-hmac-sha384-192 (RFC 8009) | ⏳ next — SP800-108 KDF + SHA-384 |
+| **23** | rc4-hmac (RFC 4757) | ⏳ next — RC4 + HMAC-MD5 + MD4(NT-hash) |
+| 1 / 3 | des-cbc-* | ✂ out of scope — dead in AD, no weak crypto shipped |
+
+etypes 19/20 (AES-SHA2) are the point of the crate: almost no Rust library implements
+RFC 8009 from scratch, and Windows Server 2022+ negotiates them.
 
 ## Conformance
 
@@ -27,10 +43,14 @@ Known-answer tested, not just round-tripped:
 - `nfold("012345", 64) == 0xbe072631276b1955` (RFC 3961 §5.2 worked example)
 - HMAC-SHA1 against RFC 2202 test case 1
 - DR/DK determinism + AES `random_to_key = identity`
-- AES-CTS round-trips across the edge lengths (1 / 15 / 16 / 17 / 32 / 47 / 48 B)
-- encrypt-then-MAC round-trip + tamper / wrong-usage / truncation rejection
+- AES-128 and AES-256 CTS round-trips across the edge lengths (16 / 17 / 31 / 32 / 47 / 48 / 64 B)
+- encrypt-then-MAC round-trip + tamper / wrong-usage / truncation rejection (both key sizes)
+- unsupported key length (e.g. AES-192) panics loudly rather than mis-deriving
 
-`cargo test` → 18 passing.
+Per-etype known-answer vectors come from RFC 3962 App B (17/18), RFC 8009 App A
+(19/20), and RFC 4757 / MS-KILE (23) as each profile lands.
+
+`cargo test` → 22 passing.
 
 ## Dependencies
 

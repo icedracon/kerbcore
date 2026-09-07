@@ -1,10 +1,11 @@
-//! RFC 3961 / RFC 3962 crypto for the `aes256-cts-hmac-sha1-96` Kerberos profile
-//! (etype 18), the AES profile every modern Active Directory KDC negotiates.
+//! RFC 3961 / RFC 3962 crypto for the AES-CTS-HMAC-SHA1 Kerberos profiles —
+//! `aes128-cts-hmac-sha1-96` (etype 17) and `aes256-cts-hmac-sha1-96` (etype 18),
+//! the AES profiles every modern Active Directory KDC negotiates.
 //!
 //! Pure Rust, no FFI, `#![forbid(unsafe_code)]` at the crate root. Building blocks:
 //! - [`nfold`] — RFC 3961 §5.2 n-fold.
 //! - [`aes_cts_encrypt`] / [`aes_cts_decrypt`] — RFC 3962 §5 AES CBC-CTS (CS3).
-//! - [`dr`] / [`dk`] — RFC 3961 §5.1 DR/DK derivation (AES-256, `random_to_key = id`).
+//! - [`dr`] / [`dk`] — RFC 3961 §5.1 DR/DK derivation (AES-128/256, `random_to_key = id`).
 //! - [`hmac_sha1_96`] — RFC 2104 HMAC-SHA1 truncated to 96 bits.
 //! - [`derive_kc`] / [`derive_ke`] / [`derive_ki`] — RFC 3961 §5.3 subkey derivation
 //!   with the 5-byte `usage||0x99|0xAA|0x55` constant.
@@ -29,6 +30,48 @@ use sha1::Sha1;
 pub const AES256_KEY_LEN: usize = 32;
 /// AES block size — the same for all AES key lengths.
 pub const AES_BLOCK_LEN: usize = 16;
+/// AES-128 key size in bytes (RFC 3962 profile 17 uses AES-128-CTS-HMAC-SHA1-96).
+pub const AES128_KEY_LEN: usize = 16;
+
+/// Key-length-dispatched AES block cipher: 16-byte key → AES-128 (etype 17),
+/// 32-byte key → AES-256 (etype 18). Lets the shared CTS / DR / DK code below be
+/// written once and serve both RFC 3962 SHA-1 profiles.
+// The AES-256 key schedule is ~60 bytes larger than AES-128's; this is a
+// short-lived stack local, so boxing to equalize the variants would only add an
+// allocation per cipher init for no benefit.
+#[allow(clippy::large_enum_variant)]
+enum AesKey {
+    K128(aes::Aes128),
+    K256(aes::Aes256),
+}
+
+impl AesKey {
+    fn new(key: &[u8]) -> Self {
+        match key.len() {
+            AES128_KEY_LEN => {
+                AesKey::K128(aes::Aes128::new_from_slice(key).expect("AES-128 key is 16 bytes"))
+            }
+            AES256_KEY_LEN => {
+                AesKey::K256(aes::Aes256::new_from_slice(key).expect("AES-256 key is 32 bytes"))
+            }
+            n => panic!("unsupported AES key length {n} (want 16 or 32)"),
+        }
+    }
+    #[inline]
+    fn encrypt_block(&self, b: &mut aes::Block) {
+        match self {
+            AesKey::K128(c) => c.encrypt_block(b),
+            AesKey::K256(c) => c.encrypt_block(b),
+        }
+    }
+    #[inline]
+    fn decrypt_block(&self, b: &mut aes::Block) {
+        match self {
+            AesKey::K128(c) => c.decrypt_block(b),
+            AesKey::K256(c) => c.decrypt_block(b),
+        }
+    }
+}
 
 // ─── n-fold (RFC 3961 §5.2) ─────────────────────────────────────────────────────
 
@@ -116,9 +159,10 @@ pub fn nfold(input: &[u8], n_bits: usize) -> Vec<u8> {
     sum
 }
 
-// ─── AES-256 CTS-CBC (RFC 3962 §5) ──────────────────────────────────────────────
+// ─── AES CTS-CBC (RFC 3962 §5) — AES-128 (etype 17) + AES-256 (etype 18) ────────
 
-/// Encrypt with AES-256 in CBC-CTS mode per RFC 3962 §5. Requires `plaintext.len() >=
+/// Encrypt with AES (128 or 256, chosen by key length) in CBC-CTS mode per RFC 3962
+/// §5. Requires `plaintext.len() >=
 /// AES_BLOCK_LEN` (Kerberos never encrypts less than one block — DR feeds exactly one
 /// block, seal_pdu prepends a 16-byte confounder before the stub). Three cases:
 ///
@@ -140,7 +184,7 @@ pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; AES_BLOCK_LEN], plaintext: &[u8]) -
         "AES-CTS requires at least one full block; got {} bytes",
         plaintext.len()
     );
-    let cipher = aes::Aes256::new_from_slice(key).expect("AES-256 key must be 32 bytes");
+    let cipher = AesKey::new(key);
     let n = plaintext.len();
     let full_blocks = n / AES_BLOCK_LEN;
     let remainder = n % AES_BLOCK_LEN;
@@ -195,7 +239,7 @@ pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; AES_BLOCK_LEN], ciphertext: &[u8]) 
         "AES-CTS ciphertext requires at least one full block; got {} bytes",
         ciphertext.len()
     );
-    let cipher = aes::Aes256::new_from_slice(key).expect("AES-256 key must be 32 bytes");
+    let cipher = AesKey::new(key);
     let n = ciphertext.len();
     let full_blocks = n / AES_BLOCK_LEN;
     let remainder = n % AES_BLOCK_LEN;
@@ -276,22 +320,24 @@ pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; AES_BLOCK_LEN], ciphertext: &[u8]) 
 
 // ─── DR / DK (RFC 3961 §5.1, specialized for AES-256 per RFC 3962 §4) ─────────
 
-/// RFC 3961 §5.1 DR: derive a random value from `key` seeded by `constant`. For AES-256,
-/// output length is `AES256_KEY_LEN` (32 bytes) — produced by iterating CTS-encrypt of
-/// 16-byte blocks (starting from n-fold(constant, 128) with an all-zero IV) until we
-/// have at least 32 bytes, then truncating.
+/// RFC 3961 §5.1 DR: derive a random value from `key` seeded by `constant`. For the
+/// AES profiles, DK preserves the enctype key size, so the output length equals the
+/// base key length — 16 bytes for AES-128 (etype 17), 32 for AES-256 (etype 18).
+/// Produced by iterating CTS-encrypt of 16-byte blocks (starting from
+/// n-fold(constant, 128) with an all-zero IV) until we have enough, then truncating.
 pub fn dr(key: &[u8], constant: &[u8]) -> Vec<u8> {
     let zero_iv = [0u8; AES_BLOCK_LEN];
     // Fold the constant to a single block first (AES block-size in bits).
     let n1 = nfold(constant, AES_BLOCK_LEN * 8);
-    let mut out = Vec::with_capacity(AES256_KEY_LEN);
+    let klen = key.len();
+    let mut out = Vec::with_capacity(klen);
     let mut r = n1;
-    while out.len() < AES256_KEY_LEN {
+    while out.len() < klen {
         let encrypted = aes_cts_encrypt(key, &zero_iv, &r);
         out.extend_from_slice(&encrypted);
         r = encrypted;
     }
-    out.truncate(AES256_KEY_LEN);
+    out.truncate(klen);
     out
 }
 
@@ -474,6 +520,59 @@ mod tests {
             let out = nfold(b"any-input", bits);
             assert_eq!(out.len() * 8, bits);
         }
+    }
+
+    // ─── etype 17 (AES-128) — same shared code path, 16-byte key ─────────
+
+    #[test]
+    fn aes128_cts_roundtrip_across_lengths() {
+        // A 16-byte key selects AES-128 through AesKey::new; the CTS wrap is the
+        // same CS3 code as AES-256, so exercise the edge lengths on the 128 path.
+        let key = [0x11u8; AES128_KEY_LEN];
+        for len in [16usize, 17, 31, 32, 47, 48, 64] {
+            let pt: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let ct = aes_cts_encrypt(&key, &[0u8; AES_BLOCK_LEN], &pt);
+            let back = aes_cts_decrypt(&key, &[0u8; AES_BLOCK_LEN], &ct);
+            assert_eq!(back, pt, "AES-128 CTS round-trip failed at len {len}");
+        }
+    }
+
+    #[test]
+    fn aes128_dk_preserves_16_byte_key_size() {
+        // DK(base_key, constant) yields a key the size of the base key: 16 for AES-128.
+        let base = [0x22u8; AES128_KEY_LEN];
+        let sub = dk(&base, &subkey_constant(2, 0xAA));
+        assert_eq!(sub.len(), AES128_KEY_LEN);
+        // And the AES-256 base still yields 32 — the two profiles don't cross-contaminate.
+        let base256 = [0x33u8; AES256_KEY_LEN];
+        assert_eq!(
+            dk(&base256, &subkey_constant(2, 0xAA)).len(),
+            AES256_KEY_LEN
+        );
+    }
+
+    #[test]
+    fn aes128_encrypt_message_roundtrip_and_tamper() {
+        let session_key = [0x44u8; AES128_KEY_LEN];
+        let conf = [0x55u8; CONFOUNDER_LEN];
+        let msg = b"etype-17 sealed payload";
+        let sealed = encrypt_message(&session_key, KG_USAGE_INITIATOR_SEAL, &conf, msg);
+        let got = decrypt_message(&session_key, KG_USAGE_INITIATOR_SEAL, &sealed).unwrap();
+        assert_eq!(got, msg);
+        // Flip a ciphertext byte → HMAC must reject (no panic, graceful Err).
+        let mut bad = sealed.clone();
+        bad[0] ^= 0x01;
+        assert!(matches!(
+            decrypt_message(&session_key, KG_USAGE_INITIATOR_SEAL, &bad),
+            Err(DecryptError::HmacMismatch)
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported AES key length")]
+    fn unsupported_key_length_panics_loudly() {
+        // A 24-byte key (AES-192, no Kerberos profile) is a caller bug, not wire input.
+        let _ = aes_cts_encrypt(&[0u8; 24], &[0u8; AES_BLOCK_LEN], &[0u8; 16]);
     }
 
     // ─── AES-256-CTS round-trip across every case ────────────────────────
