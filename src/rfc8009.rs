@@ -193,10 +193,58 @@ pub fn decrypt(
     Ok(conf_plain[AES_BLOCK_LEN..].to_vec())
 }
 
+/// The enctype-name prefix that RFC 8009 §4 mixes into the salt.
+fn enctype_name(etype: Rfc8009Etype) -> &'static [u8] {
+    match etype {
+        Rfc8009Etype::Aes128Sha256 => b"aes128-cts-hmac-sha256-128",
+        Rfc8009Etype::Aes256Sha384 => b"aes256-cts-hmac-sha384-192",
+    }
+}
+
+/// RFC 8009 §4 string-to-key: `saltp = enctype-name || 0x00 || salt`;
+/// `tkey = PBKDF2-HMAC-SHA2(passphrase, saltp, iterations, key_len)`;
+/// `base-key = KDF-HMAC-SHA2(tkey, "kerberos", key_len)`. Default iterations 32768.
+pub fn string_to_key(
+    etype: Rfc8009Etype,
+    passphrase: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> Vec<u8> {
+    let mut saltp = enctype_name(etype).to_vec();
+    saltp.push(0x00);
+    saltp.extend_from_slice(salt);
+    let tkey = crate::crypto::pbkdf2(
+        |k, d| etype.prf(k, d),
+        etype.hash_len(),
+        passphrase,
+        &saltp,
+        iterations,
+        etype.key_len(),
+    );
+    kdf(etype, &tkey, b"kerberos", etype.key_len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Rfc8009Etype::*;
     use super::*;
+
+    // ── RFC 8009 §7 string-to-key: standard inputs → the published base-keys ─
+    #[test]
+    fn string_to_key_matches_rfc8009_section7() {
+        // iter 32768, pass "password"; the §7 salt carries a 16-byte binary
+        // prefix before the realm string.
+        let mut salt = unhex("10 DF 9D D7 83 E5 BC 8A CE A1 73 0E 74 35 5F 61");
+        salt.extend_from_slice(b"ATHENA.MIT.EDUraeburn");
+        assert_eq!(
+            hex(&string_to_key(Aes128Sha256, b"password", &salt, 32768)),
+            "089bca48b105ea6ea77ca5d2f39dc5e7"
+        );
+        assert_eq!(
+            hex(&string_to_key(Aes256Sha384, b"password", &salt, 32768)),
+            "45bd806dbf6a833a9cffc1c94589a222367a79bc21c413718906e9f578a78467"
+        );
+    }
 
     /// Parse hex ignoring ALL whitespace, so vectors can be pasted byte-spaced
     /// verbatim from the RFC without any mid-byte-space hazard.

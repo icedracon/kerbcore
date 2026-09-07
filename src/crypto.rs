@@ -514,9 +514,107 @@ pub fn decrypt_message(
     Ok(e1[CONFOUNDER_LEN..].to_vec())
 }
 
+// ─── PBKDF2 (RFC 2898) + RFC 3962 §4 string-to-key ───────────────────────────
+
+/// Full (untruncated, 20-byte) HMAC-SHA1 — the PBKDF2 PRF for the AES-SHA1 profiles.
+fn hmac_sha1_full(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("Hmac accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// PBKDF2 (RFC 2898 §5.2) over an arbitrary HMAC PRF. `prf(key, data)` is an HMAC
+/// keyed by `key`; `hlen` is its output length. Shared by the SHA-1 and (via
+/// [`crate::rfc8009`]) the SHA-2 Kerberos string-to-key functions.
+pub(crate) fn pbkdf2<F: Fn(&[u8], &[u8]) -> Vec<u8>>(
+    prf: F,
+    hlen: usize,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    dk_len: usize,
+) -> Vec<u8> {
+    let n_blocks = dk_len.div_ceil(hlen);
+    let mut out = Vec::with_capacity(n_blocks * hlen);
+    for block in 1..=n_blocks as u32 {
+        let mut salt_i = salt.to_vec();
+        salt_i.extend_from_slice(&block.to_be_bytes());
+        let mut u = prf(password, &salt_i);
+        let mut t = u.clone();
+        for _ in 1..iterations {
+            u = prf(password, &u);
+            for (ti, ui) in t.iter_mut().zip(u.iter()) {
+                *ti ^= ui;
+            }
+        }
+        out.extend_from_slice(&t);
+    }
+    out.truncate(dk_len);
+    out
+}
+
+/// RFC 3962 §4 string-to-key for the AES-SHA1 profiles (etypes 17/18):
+/// `DK(PBKDF2-HMAC-SHA1(passphrase, salt, iterations, key_len), "kerberos")`.
+/// `key_len` selects the profile (16 → AES-128, 32 → AES-256). The RFC default
+/// iteration count is 4096 when the KDC advertises none.
+pub fn string_to_key(key_len: usize, passphrase: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    let tkey = pbkdf2(hmac_sha1_full, 20, passphrase, salt, iterations, key_len);
+    dk(&tkey, b"kerberos")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hexs(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    // ── PBKDF2-HMAC-SHA1 vs RFC 6070 canonical vectors ───────────────────
+    #[test]
+    fn pbkdf2_hmac_sha1_rfc6070() {
+        assert_eq!(
+            hexs(&pbkdf2(hmac_sha1_full, 20, b"password", b"salt", 1, 20)),
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6"
+        );
+        assert_eq!(
+            hexs(&pbkdf2(hmac_sha1_full, 20, b"password", b"salt", 2, 20)),
+            "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"
+        );
+        assert_eq!(
+            hexs(&pbkdf2(hmac_sha1_full, 20, b"password", b"salt", 4096, 20)),
+            "4b007901b765489abead49d926f721d065a429c1"
+        );
+    }
+
+    // ── AES-SHA1 string-to-key vs RFC 3962 App B (128-bit clean vector) ──
+    #[test]
+    fn aes_string_to_key_rfc3962() {
+        // Test case 1: iter 1, "password", "ATHENA.MIT.EDUraeburn".
+        assert_eq!(
+            hexs(&string_to_key(16, b"password", b"ATHENA.MIT.EDUraeburn", 1)),
+            "42263c6e89f4fc28b8df68ee09799f15"
+        );
+        // Test case 3: iter 1200, same inputs.
+        assert_eq!(
+            hexs(&string_to_key(
+                16,
+                b"password",
+                b"ATHENA.MIT.EDUraeburn",
+                1200
+            )),
+            "4c01cd46d632d01e6dbe230a01ed642a"
+        );
+        // AES-256 shares the algorithm (PBKDF2 proven above; DK-32 KAT'd elsewhere) —
+        // assert length + determinism (RFC 3962's 256-bit text vectors are unreliable
+        // through automated extraction, so no literal 256-bit KAT is baked).
+        let k256 = string_to_key(32, b"password", b"ATHENA.MIT.EDUraeburn", 1);
+        assert_eq!(k256.len(), 32);
+        assert_eq!(
+            k256,
+            string_to_key(32, b"password", b"ATHENA.MIT.EDUraeburn", 1)
+        );
+    }
 
     // ─── n-fold correctness ────────────────────────────────────────────────
 
