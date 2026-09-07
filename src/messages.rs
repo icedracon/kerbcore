@@ -615,7 +615,11 @@ mod tests {
             crealm: "EXAMPLE.COM".into(),
             cname: sample_princ(),
             ticket: sample_ticket(),
-            enc_part: EncryptedData { etype: 18, kvno: None, cipher: vec![1, 2, 3] },
+            enc_part: EncryptedData {
+                etype: 18,
+                kvno: None,
+                cipher: vec![1, 2, 3],
+            },
         };
         let der = rep.encode();
         let pk: picky_krb::messages::AsRep =
