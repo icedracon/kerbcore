@@ -19,5 +19,6 @@
 #![forbid(unsafe_code)]
 
 pub mod crypto;
+pub mod rc4;
 
 pub use crypto::*;

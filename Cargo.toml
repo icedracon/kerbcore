@@ -4,7 +4,7 @@ version = "0.1.0-beta.1"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-description = "Pure-Rust Kerberos RFC 3961/3962 crypto (aes256-cts-hmac-sha1-96) — ASN.1 codec + AS/TGS client to follow. No FFI, no host krb5."
+description = "Pure-Rust Kerberos wire crypto — the full AES-SHA1/SHA2 + RC4 etype matrix (RFC 3961/3962/8009/4757). ASN.1 codec + AS/TGS client to follow. No FFI, no host krb5."
 keywords = ["kerberos", "rfc3961", "rfc3962", "authentication", "crypto"]
 categories = ["cryptography", "authentication", "parser-implementations"]
 repository = "https://github.com/icedracon/kerbcore"
@@ -21,3 +21,12 @@ publish = false
 aes = "0.8"
 hmac = "0.12"
 sha1 = "0.10"
+# etype 23 (RC4-HMAC): NT-hash string-to-key + HMAC-MD5. RC4 itself is hand-rolled.
+md4 = "0.10"
+md-5 = "0.10"
+
+[dev-dependencies]
+# Differential oracle: kerbcore's RC4-HMAC must match our live-DC-validated
+# ms-pac-forge implementation byte-for-byte. Dev-only — NEVER a runtime dep
+# (the whole point of kerbcore is to remove external crypto deps).
+ms-pac-forge = "0.1.3"
