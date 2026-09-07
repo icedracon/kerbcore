@@ -1,0 +1,23 @@
+[package]
+name = "kerbcore"
+version = "0.1.0-beta.1"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Pure-Rust Kerberos RFC 3961/3962 crypto (aes256-cts-hmac-sha1-96) — ASN.1 codec + AS/TGS client to follow. No FFI, no host krb5."
+keywords = ["kerberos", "rfc3961", "rfc3962", "authentication", "crypto"]
+categories = ["cryptography", "authentication", "parser-implementations"]
+repository = "https://github.com/icedracon/kerbcore"
+readme = "README.md"
+
+# SPIKE STATUS (1.5.1): local, unpublished. `publish = false` until the ASN.1
+# codec lands and the differential-vs-picky-krb migration is clean (see the
+# ADhammer PLAN_KRB_CRATE.md). Name reserved on crates.io intent only — NOT
+# published. Ship target when frozen: 0.1.0-beta.1.
+publish = false
+
+[dependencies]
+# RFC 3962 AES-CTS uses the block-level API only; CBC + CTS wrap is hand-rolled.
+aes = "0.8"
+hmac = "0.12"
+sha1 = "0.10"
