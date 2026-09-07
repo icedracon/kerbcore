@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod crypto;
+pub mod der;
 pub mod rc4;
 pub mod rfc8009;
 
