@@ -170,11 +170,14 @@ fn live_as_exchange() {
     assert_eq!(session_key.keyvalue.len(), 32);
 
     // ── Stage 3: TGS-REQ (AP-REQ w/ the TGT) → TGS-REP → service session key ─
+    let tgt_key =
+        kerbcore::KerberosKey::from_i32(session_key.keytype, session_key.keyvalue.clone())
+            .expect("TGT session key etype supported");
     let tgs = build_tgs_req(
         &realm,
         &krbtgt_sname(&realm), // ask for a ticket to the TGS itself (always valid)
         &rep.ticket,
-        &session_key.keyvalue,
+        &tgt_key,
         &realm,
         &cname,
         0x5555_6666,
@@ -182,7 +185,8 @@ fn live_as_exchange() {
         &[AES256],
         &unix_to_kerberos_time(now_secs()),
         0,
-    );
+    )
+    .expect("build TGS-REQ");
     let resp3 = kdc_exchange(&target, &tgs);
     if let Ok(e) = KrbError::decode(&resp3) {
         panic!(

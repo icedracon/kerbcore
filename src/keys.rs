@@ -57,11 +57,24 @@ impl Enctype {
         }
     }
     /// The confounder length in bytes (one AES block for AES; 8 for RC4).
-    fn confounder_len(self) -> usize {
+    pub fn confounder_len(self) -> usize {
         match self {
             Self::Rc4Hmac => rc4::RC4_CONFOUNDER_LEN,
             _ => crypto::CONFOUNDER_LEN,
         }
+    }
+    /// The cksumtype kerbcore emits for a TGS-REQ authenticator under this key, or `None`
+    /// when kerbcore does not yet emit one for it. `None` for the RFC 8009 etypes: their
+    /// authenticator cksumtype integers are not yet verified here, and AD does not issue
+    /// RFC 8009 TGT session keys by default, so [`crate::client::build_tgs_req`] refuses
+    /// rather than guess. AES-SHA1 = 15/16 (RFC 3962), RC4 = -138 (hmac-md5).
+    pub fn authenticator_cksumtype(self) -> Option<i32> {
+        Some(match self {
+            Self::Aes128CtsHmacSha1_96 => 15,
+            Self::Aes256CtsHmacSha1_96 => 16,
+            Self::Rc4Hmac => rc4::SIG_HMAC_MD5,
+            Self::Aes128CtsHmacSha256_128 | Self::Aes256CtsHmacSha384_192 => return None,
+        })
     }
     fn rfc8009(self) -> Option<Rfc8009Etype> {
         match self {

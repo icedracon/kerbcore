@@ -180,11 +180,6 @@ pub const PA_TGS_REQ: i32 = 1;
 /// Checksum type hmac-sha1-96-aes256 (RFC 3962).
 pub const CKSUM_HMAC_SHA1_96_AES256: i32 = 16;
 
-/// `hmac-sha1-96-aes256` checksum: HMAC-SHA1-96 keyed by `Kc = DK(key, usage||0x99)`.
-fn aes_checksum(key: &[u8], usage: u32, data: &[u8]) -> Vec<u8> {
-    crate::crypto::hmac_sha1_96(&crate::crypto::derive_kc(key, usage), data).to_vec()
-}
-
 /// `Authenticator ::= [APPLICATION 2] SEQUENCE { … }` (the pieces a TGS-REQ needs).
 fn encode_authenticator(
     crealm: &str,
@@ -219,31 +214,21 @@ fn encode_ap_req(ticket_der: &[u8], enc_auth: &EncryptedData) -> Vec<u8> {
     tlv(application_tag(14), &encode_sequence(&body))
 }
 
-/// Draw a fresh 16-byte Kerberos confounder from the OS CSPRNG. A confounder must be
-/// unpredictable per RFC 8009 §3 / RFC 3961 §5.3 — a fixed one leaks plaintext structure
-/// across sealed authenticators. Panics only if the OS RNG is unavailable (a broken host).
-fn random_confounder() -> [u8; crate::crypto::CONFOUNDER_LEN] {
-    let mut c = [0u8; crate::crypto::CONFOUNDER_LEN];
-    getrandom::getrandom(&mut c).expect("OS CSPRNG available for Kerberos confounder");
-    c
-}
-
-/// Build a TGS-REQ for `sname`, authenticated by `tgt` + `tgt_session_key` (from the
-/// AS exchange). The authenticator's checksum covers the KDC-REQ-BODY (usage 6) and
-/// the authenticator itself is encrypted under the TGT session key (usage 7), with a
-/// **fresh random confounder** drawn from the OS CSPRNG.
+/// Build a TGS-REQ for `sname`, authenticated by `tgt` + the TGT session key (from the AS
+/// exchange). **Etype-generic:** the authenticator's checksum type, the encryption, and the
+/// `EncryptedData.etype` are all taken from the session key's [`crate::keys::Enctype`] — no
+/// hardcoded AES256. The authenticator's checksum covers the KDC-REQ-BODY (usage 6); the
+/// authenticator is encrypted under the session key (usage 7) with a **fresh CSPRNG confounder**.
 ///
-/// LIMITATION (0.1.x): this targets the AES-SHA1 session-key profile — cksumtype 16,
-/// etype 18, the profile every Active Directory KDC issues for the TGT session key.
-/// RC4 / RFC 8009 TGT session keys need the typed-key enctype dispatch planned for
-/// 0.2.0. For deterministic output (tests, differential vectors) use
-/// [`build_tgs_req_with_confounder`].
+/// Returns [`crate::keys::KeyError::UnsupportedEnctype`] for an RFC 8009 (etype 19/20) session
+/// key — its authenticator cksumtype is not yet emitted here (AD does not issue RFC 8009 TGT
+/// session keys by default). For deterministic output use [`build_tgs_req_with_confounder`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_tgs_req(
     realm: &str,
     sname: &PrincipalName,
     tgt: &Ticket,
-    tgt_session_key: &[u8],
+    tgt_session_key: &crate::keys::KerberosKey,
     crealm: &str,
     cname: &PrincipalName,
     nonce: u32,
@@ -251,7 +236,9 @@ pub fn build_tgs_req(
     etypes: &[i32],
     ctime: &str,
     cusec: i32,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, crate::keys::KeyError> {
+    let mut conf = vec![0u8; tgt_session_key.enctype().confounder_len()];
+    getrandom::getrandom(&mut conf).expect("OS CSPRNG available for Kerberos confounder");
     build_tgs_req_with_confounder(
         realm,
         sname,
@@ -264,21 +251,19 @@ pub fn build_tgs_req(
         etypes,
         ctime,
         cusec,
-        &random_confounder(),
+        &conf,
     )
 }
 
-/// Deterministic-confounder form of [`build_tgs_req`]. Callers pass the 16-byte
-/// authenticator confounder explicitly — for reproducible test/differential vectors,
-/// or to hand the same value to a peer implementation. **Production code must use
-/// [`build_tgs_req`]**, which draws the confounder from the OS CSPRNG; a reused or
-/// predictable confounder weakens the sealed authenticator.
+/// Deterministic-confounder form of [`build_tgs_req`]. `confounder` must be the session key's
+/// [`crate::keys::Enctype::confounder_len`] (16 for AES, 8 for RC4). **Production code uses
+/// [`build_tgs_req`]** (CSPRNG confounder); a reused/predictable one weakens the authenticator.
 #[allow(clippy::too_many_arguments)]
 pub fn build_tgs_req_with_confounder(
     realm: &str,
     sname: &PrincipalName,
     tgt: &Ticket,
-    tgt_session_key: &[u8],
+    tgt_session_key: &crate::keys::KerberosKey,
     crealm: &str,
     cname: &PrincipalName,
     nonce: u32,
@@ -286,8 +271,12 @@ pub fn build_tgs_req_with_confounder(
     etypes: &[i32],
     ctime: &str,
     cusec: i32,
-    confounder: &[u8; crate::crypto::CONFOUNDER_LEN],
-) -> Vec<u8> {
+    confounder: &[u8],
+) -> Result<Vec<u8>, crate::keys::KeyError> {
+    let enctype = tgt_session_key.enctype();
+    let cksumtype = enctype
+        .authenticator_cksumtype()
+        .ok_or(crate::keys::KeyError::UnsupportedEnctype(enctype.to_i32()))?;
     // TGS-REQ omits cname in the body (identity comes from the ticket).
     let body = KdcReqBody {
         kdc_options: 0x4081_0000,
@@ -305,26 +294,26 @@ pub fn build_tgs_req_with_confounder(
     };
     let body_der = body.encode();
     let cksum = Checksum {
-        cksumtype: CKSUM_HMAC_SHA1_96_AES256,
-        checksum: aes_checksum(tgt_session_key, KU_TGS_REQ_AUTH_CKSUM, &body_der),
+        cksumtype,
+        checksum: tgt_session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body_der),
     };
     let auth = encode_authenticator(crealm, cname, cusec, ctime, Some(&cksum));
     let enc_auth = EncryptedData {
-        etype: 18,
+        etype: enctype.to_i32(),
         kvno: None,
-        cipher: crate::crypto::encrypt_message(tgt_session_key, KU_TGS_REQ_AUTH, confounder, &auth),
+        cipher: tgt_session_key.encrypt_with_confounder(KU_TGS_REQ_AUTH, confounder, &auth),
     };
     let ap_req = encode_ap_req(&tgt.encode(), &enc_auth);
     let padata = vec![PaData {
         padata_type: PA_TGS_REQ,
         padata_value: ap_req,
     }];
-    KdcReq {
+    Ok(KdcReq {
         msg_type: 12,
         padata,
         req_body: body,
     }
-    .encode()
+    .encode())
 }
 
 #[cfg(test)]
@@ -384,6 +373,11 @@ mod tests {
         }
     }
 
+    fn sample_sk() -> crate::keys::KerberosKey {
+        crate::keys::KerberosKey::new(crate::keys::Enctype::Aes256CtsHmacSha1_96, vec![0x11u8; 32])
+            .unwrap()
+    }
+
     #[test]
     fn tgs_req_uses_fresh_random_confounder() {
         // Two TGS-REQs with byte-identical inputs must differ — the confounder is
@@ -391,7 +385,7 @@ mod tests {
         // `0x5a ^ i` confounder.)
         let (tgt, sk, sname, cname) = (
             sample_tgt(),
-            [0x11u8; 32],
+            sample_sk(),
             svc_sname(),
             client_cname("alice"),
         );
@@ -407,7 +401,8 @@ mod tests {
             &[18],
             "20240102030405Z",
             0,
-        );
+        )
+        .unwrap();
         let b = build_tgs_req(
             "EXAMPLE.COM",
             &sname,
@@ -420,49 +415,65 @@ mod tests {
             &[18],
             "20240102030405Z",
             0,
-        );
+        )
+        .unwrap();
         assert_ne!(a, b, "TGS-REQ must use a fresh random confounder each call");
     }
 
     #[test]
-    fn tgs_req_with_confounder_is_deterministic() {
+    fn tgs_req_with_confounder_is_deterministic_and_etype_correct() {
         let (tgt, sk, sname, cname) = (
             sample_tgt(),
-            [0x11u8; 32],
+            sample_sk(),
             svc_sname(),
             client_cname("alice"),
         );
         let conf = [0x24u8; 16];
-        let a = build_tgs_req_with_confounder(
-            "EXAMPLE.COM",
-            &sname,
-            &tgt,
-            &sk,
-            "EXAMPLE.COM",
-            &cname,
-            1,
-            "20370913024805Z",
-            &[18],
-            "20240102030405Z",
-            0,
-            &conf,
-        );
-        let b = build_tgs_req_with_confounder(
-            "EXAMPLE.COM",
-            &sname,
-            &tgt,
-            &sk,
-            "EXAMPLE.COM",
-            &cname,
-            1,
-            "20370913024805Z",
-            &[18],
-            "20240102030405Z",
-            0,
-            &conf,
-        );
-        assert_eq!(a, b, "same confounder + inputs must be byte-identical");
-        // And the result is a well-formed TGS-REQ ([APPLICATION 12]).
+        let mk = || {
+            build_tgs_req_with_confounder(
+                "EXAMPLE.COM",
+                &sname,
+                &tgt,
+                &sk,
+                "EXAMPLE.COM",
+                &cname,
+                1,
+                "20370913024805Z",
+                &[18],
+                "20240102030405Z",
+                0,
+                &conf,
+            )
+            .unwrap()
+        };
+        let a = mk();
+        assert_eq!(a, mk(), "same confounder + inputs must be byte-identical");
         assert_eq!(KdcReq::decode(&a).unwrap().msg_type, 12);
+    }
+
+    #[test]
+    fn tgs_req_rejects_rfc8009_session_key() {
+        // RFC 8009 (etype 19/20) session keys are not yet wired for the authenticator
+        // cksumtype — must be a clean error, not a wrong/guessed constant.
+        let sk = crate::keys::KerberosKey::new(
+            crate::keys::Enctype::Aes256CtsHmacSha384_192,
+            vec![0u8; 32],
+        )
+        .unwrap();
+        let err = build_tgs_req(
+            "EXAMPLE.COM",
+            &svc_sname(),
+            &sample_tgt(),
+            &sk,
+            "EXAMPLE.COM",
+            &client_cname("alice"),
+            1,
+            "20370913024805Z",
+            &[20],
+            "20240102030405Z",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::keys::KeyError::UnsupportedEnctype(20)));
     }
 }
