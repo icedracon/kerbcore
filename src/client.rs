@@ -280,13 +280,16 @@ pub const PA_TGS_REQ: i32 = 1;
 /// Checksum type hmac-sha1-96-aes256 (RFC 3962).
 pub const CKSUM_HMAC_SHA1_96_AES256: i32 = 16;
 
-/// `Authenticator ::= [APPLICATION 2] SEQUENCE { … }` (the pieces a TGS-REQ needs).
+/// `Authenticator ::= [APPLICATION 2] SEQUENCE { … }`. `subkey`/`seq_number` are optional
+/// (a TGS-REQ omits both; an application/GSS AP-REQ usually supplies them).
 fn encode_authenticator(
     crealm: &str,
     cname: &PrincipalName,
     cusec: i32,
     ctime: &str,
     cksum: Option<&Checksum>,
+    subkey: Option<&crate::types::EncryptionKey>,
+    seq_number: Option<u32>,
 ) -> Vec<u8> {
     let mut body = explicit(0, &encode_integer(5)); // authenticator-vno
     body.extend_from_slice(&explicit(1, &encode_realm(crealm)));
@@ -296,13 +299,23 @@ fn encode_authenticator(
     }
     body.extend_from_slice(&explicit(4, &encode_integer(cusec as i64)));
     body.extend_from_slice(&explicit(5, &KerberosTime(ctime.to_string()).encode()));
+    if let Some(sk) = subkey {
+        body.extend_from_slice(&explicit(6, &sk.encode()));
+    }
+    if let Some(n) = seq_number {
+        body.extend_from_slice(&explicit(7, &encode_integer(n as i64)));
+    }
     tlv(application_tag(2), &encode_sequence(&body))
 }
 
 /// `AP-REQ ::= [APPLICATION 14] SEQUENCE { pvno [0], msg-type [1], ap-options [2],
-/// ticket [3] Ticket, authenticator [4] EncryptedData }`.
-fn encode_ap_req(ticket_der: &[u8], enc_auth: &EncryptedData) -> Vec<u8> {
-    let ap_options = tlv(TAG_BIT_STRING, &[0x00, 0, 0, 0, 0]); // no options set
+/// ticket [3] Ticket, authenticator [4] EncryptedData }`. `ap_options` is the 32-bit
+/// `APOptions` flags value (e.g. [`AP_OPTS_MUTUAL_REQUIRED`]).
+fn encode_ap_req(ticket_der: &[u8], enc_auth: &EncryptedData, ap_options: u32) -> Vec<u8> {
+    // KerberosFlags: BIT STRING, unused-bits octet (0) + 4 flag octets, big-endian.
+    let mut opt = vec![0u8];
+    opt.extend_from_slice(&ap_options.to_be_bytes());
+    let ap_options = tlv(TAG_BIT_STRING, &opt);
     let body = [
         explicit(0, &encode_integer(5)),
         explicit(1, &encode_integer(14)),
@@ -397,13 +410,13 @@ pub fn build_tgs_req_with_confounder(
         cksumtype,
         checksum: tgt_session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body_der),
     };
-    let auth = encode_authenticator(crealm, cname, cusec, ctime, Some(&cksum));
+    let auth = encode_authenticator(crealm, cname, cusec, ctime, Some(&cksum), None, None);
     let enc_auth = EncryptedData {
         etype: enctype.to_i32(),
         kvno: None,
         cipher: tgt_session_key.encrypt_with_confounder(KU_TGS_REQ_AUTH, confounder, &auth),
     };
-    let ap_req = encode_ap_req(&tgt.encode(), &enc_auth);
+    let ap_req = encode_ap_req(&tgt.encode(), &enc_auth, 0);
     let padata = vec![PaData {
         padata_type: PA_TGS_REQ,
         padata_value: ap_req,
@@ -414,6 +427,142 @@ pub fn build_tgs_req_with_confounder(
         req_body: body,
     }
     .encode())
+}
+
+// ── AP exchange (application authentication, RFC 4120 §5.5) ───────────────────
+
+/// Key usage — AP-REQ authenticator checksum.
+pub const KU_AP_REQ_AUTH_CKSUM: u32 = 10;
+/// Key usage — AP-REQ authenticator (encrypted under the ticket session key or a subkey).
+pub const KU_AP_REQ_AUTH: u32 = 11;
+/// Key usage — AP-REP `EncAPRepPart` (encrypted under the ticket session key).
+pub const KU_AP_REP_ENC_PART: u32 = 12;
+
+/// `APOptions` MUTUAL-REQUIRED (bit 2) — the client asks the service to prove it can read
+/// the ticket by returning an AP-REP (mutual authentication).
+pub const AP_OPTS_MUTUAL_REQUIRED: u32 = 0x2000_0000;
+/// `APOptions` USE-SESSION-KEY (bit 1) — the ticket is encrypted in the session key (user2user).
+pub const AP_OPTS_USE_SESSION_KEY: u32 = 0x4000_0000;
+
+/// Build a standalone **AP-REQ** ([APPLICATION 14]) to authenticate to a service, using a
+/// service `ticket` (from a TGS exchange) and its `session_key`. Deterministic variant: the
+/// caller supplies the authenticator-encryption `confounder`. `ap_options` is typically
+/// [`AP_OPTS_MUTUAL_REQUIRED`] (or `0`); `cksum` carries an application checksum (e.g. the
+/// RFC 4121 `0x8003` channel-binding checksum for GSS); `subkey`/`seq_number` negotiate a
+/// per-message key and sequence base.
+///
+/// Etype-generic: the authenticator encryption + `EncryptedData.etype` come from
+/// `session_key`'s [`crate::keys::Enctype`]. Returns the AP-REQ DER.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ap_req_with_confounder(
+    ticket: &Ticket,
+    session_key: &crate::keys::KerberosKey,
+    crealm: &str,
+    cname: &PrincipalName,
+    ctime: &str,
+    cusec: i32,
+    ap_options: u32,
+    cksum: Option<&Checksum>,
+    subkey: Option<&crate::types::EncryptionKey>,
+    seq_number: Option<u32>,
+    confounder: &[u8],
+) -> Vec<u8> {
+    let enctype = session_key.enctype();
+    let auth = encode_authenticator(crealm, cname, cusec, ctime, cksum, subkey, seq_number);
+    let enc_auth = EncryptedData {
+        etype: enctype.to_i32(),
+        kvno: None,
+        cipher: session_key.encrypt_with_confounder(KU_AP_REQ_AUTH, confounder, &auth),
+    };
+    encode_ap_req(&ticket.encode(), &enc_auth, ap_options)
+}
+
+/// Fields of an `EncAPRepPart` ([APPLICATION 27], RFC 4120 §5.5.2). The client authenticates
+/// the service by confirming `ctime`/`cusec` echo the AP-REQ authenticator ([`verify_ap_rep`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncApRepPart {
+    /// Client time echoed from the AP-REQ authenticator.
+    pub ctime: String,
+    /// Client microseconds echoed from the AP-REQ authenticator.
+    pub cusec: i32,
+    /// Optional negotiated subkey (the service's choice for per-message tokens).
+    pub subkey: Option<crate::types::EncryptionKey>,
+    /// Optional starting sequence number chosen by the service.
+    pub seq_number: Option<u32>,
+}
+
+/// Extract the encrypted part of an **AP-REP** ([APPLICATION 15], RFC 4120 §5.5.2). Decrypt the
+/// returned [`EncryptedData`] under the ticket session key at usage [`KU_AP_REP_ENC_PART`],
+/// then pass the plaintext to [`parse_enc_ap_rep_part`]. Total: malformed input errors.
+pub fn parse_ap_rep(der: &[u8]) -> Result<EncryptedData, DerError> {
+    let mut r = Der::new(der);
+    let (tag, inner) = r.read_tlv()?;
+    if tag != application_tag(15) {
+        return Err(DerError::TagMismatch {
+            expected: application_tag(15),
+            found: tag,
+        });
+    }
+    let seq = one_or(inner, TAG_SEQUENCE)?;
+    let mut sr = Der::new(seq);
+    let pvno = crate::der::read_u32(sr.expect(context_tag(0))?)?;
+    let msg_type = crate::der::read_u32(sr.expect(context_tag(1))?)?;
+    if pvno != 5 || msg_type != 15 {
+        return Err(DerError::MsgTypeMismatch);
+    }
+    EncryptedData::decode(sr.expect(context_tag(2))?)
+}
+
+/// Parse a decrypted `EncAPRepPart` ([APPLICATION 27]). Total: malformed input errors.
+pub fn parse_enc_ap_rep_part(plaintext: &[u8]) -> Result<EncApRepPart, DerError> {
+    let mut r = Der::new(plaintext);
+    let (tag, inner) = r.read_tlv()?;
+    if tag != application_tag(27) {
+        return Err(DerError::TagMismatch {
+            expected: application_tag(27),
+            found: tag,
+        });
+    }
+    let seq = one_or(inner, TAG_SEQUENCE)?;
+    let mut sr = Der::new(seq);
+    let ctime = KerberosTime::decode(sr.expect(context_tag(0))?)?.0;
+    let cusec = {
+        let mut ir = Der::new(sr.expect(context_tag(1))?);
+        i32::try_from(ir.read_integer()?).map_err(|_| DerError::IntTooLarge)?
+    };
+    let subkey = if sr.peek_tag() == Some(context_tag(2)) {
+        Some(crate::types::EncryptionKey::decode(
+            sr.expect(context_tag(2))?,
+        )?)
+    } else {
+        None
+    };
+    let seq_number = if sr.peek_tag() == Some(context_tag(3)) {
+        Some(crate::der::read_u32(sr.expect(context_tag(3))?)?)
+    } else {
+        None
+    };
+    Ok(EncApRepPart {
+        ctime,
+        cusec,
+        subkey,
+        seq_number,
+    })
+}
+
+/// Mutual-authentication check: parse a decrypted `EncAPRepPart` and confirm it echoes the
+/// `ctime`/`cusec` from our AP-REQ authenticator. A mismatch ([`DerError::MsgTypeMismatch`])
+/// means the peer could not read the ticket — reject the context.
+pub fn verify_ap_rep(
+    plaintext: &[u8],
+    expected_ctime: &str,
+    expected_cusec: i32,
+) -> Result<EncApRepPart, DerError> {
+    let part = parse_enc_ap_rep_part(plaintext)?;
+    if part.ctime != expected_ctime || part.cusec != expected_cusec {
+        return Err(DerError::MsgTypeMismatch);
+    }
+    Ok(part)
 }
 
 #[cfg(test)]
@@ -656,6 +805,68 @@ mod tests {
         assert_eq!(entries[1].s2kparams, None);
         assert_eq!(entries[1].s2k_iterations(), None);
         assert_eq!(entries[2].s2k_iterations(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn ap_req_build_then_ap_rep_mutual_auth_round_trip() {
+        let sk = sample_sk(); // aes256 session key
+        let ctime = "20260908120000Z";
+        let cusec = 424242;
+        // Client builds a mutual-auth AP-REQ.
+        let ap_req = build_ap_req_with_confounder(
+            &sample_tgt(),
+            &sk,
+            "EXAMPLE.COM",
+            &client_cname("alice"),
+            ctime,
+            cusec,
+            AP_OPTS_MUTUAL_REQUIRED,
+            None,
+            None,
+            Some(1),
+            &[0x55u8; 16],
+        );
+        assert!(!ap_req.is_empty());
+
+        // Service side: craft the matching AP-REP echoing ctime/cusec, encrypted at usage 12.
+        let enc_part = tlv(
+            application_tag(27),
+            &encode_sequence(
+                &[
+                    explicit(0, &KerberosTime(ctime.into()).encode()),
+                    explicit(1, &encode_integer(cusec as i64)),
+                ]
+                .concat(),
+            ),
+        );
+        let ed = EncryptedData {
+            etype: sk.enctype().to_i32(),
+            kvno: None,
+            cipher: sk.encrypt(KU_AP_REP_ENC_PART, &enc_part),
+        };
+        let ap_rep = tlv(
+            application_tag(15),
+            &encode_sequence(
+                &[
+                    explicit(0, &encode_integer(5)),
+                    explicit(1, &encode_integer(15)),
+                    explicit(2, &ed.encode()),
+                ]
+                .concat(),
+            ),
+        );
+
+        // Client verifies mutual auth end-to-end.
+        let got = parse_ap_rep(&ap_rep).unwrap();
+        let plain = sk.decrypt(KU_AP_REP_ENC_PART, &got.cipher).unwrap();
+        let part = verify_ap_rep(&plain, ctime, cusec).unwrap();
+        assert_eq!(part.ctime, ctime);
+        assert_eq!(part.cusec, cusec);
+        // A wrong ctime is rejected (a service that could not read the ticket).
+        assert!(matches!(
+            verify_ap_rep(&plain, "20000101000000Z", cusec),
+            Err(DerError::MsgTypeMismatch)
+        ));
     }
 
     #[test]
