@@ -36,6 +36,7 @@ pub mod der;
 pub mod gss;
 pub mod keys;
 pub mod kkdcp;
+pub mod kpasswd;
 pub mod messages;
 pub mod rc4;
 pub mod rfc8009;
