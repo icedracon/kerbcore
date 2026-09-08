@@ -38,6 +38,7 @@ pub mod keys;
 pub mod messages;
 pub mod rc4;
 pub mod rfc8009;
+pub mod spnego;
 pub mod types;
 
 pub use crypto::*;
