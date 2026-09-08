@@ -8,6 +8,7 @@ description = "Pure-Rust Kerberos: full etype crypto (AES-SHA1/SHA2 + RC4, RFC 3
 keywords = ["kerberos", "rfc3961", "rfc3962", "authentication", "crypto"]
 categories = ["cryptography", "authentication", "parser-implementations"]
 documentation = "https://docs.rs/kerbcore"
+repository = "https://github.com/icedracon/kerbcore"
 readme = "README.md"
 # Internal dev tooling — never part of the published crate.
 exclude = [".githooks/*", ".gitignore"]
@@ -15,7 +16,6 @@ exclude = [".githooks/*", ".gitignore"]
 # STATUS: crypto + DER/RFC4120 codec + AS/TGS client complete; live-validated AS+TGS
 # vs Server 2019/2022/2025; total DER decoder fuzz-clean (6.4B runs). Published on
 # crates.io; API is pre-1.0 and may change (typed-key enctype dispatch lands in 0.2.0).
-# No GitHub mirror yet — `repository` returns once the public repo exists.
 
 [dependencies]
 # RFC 3962 AES-CTS uses the block-level API only; CBC + CTS wrap is hand-rolled.
