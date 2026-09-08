@@ -12,7 +12,16 @@
 //! - [`der`] + [`types`] + [`messages`] — a hand-rolled X.690 DER codec (total,
 //!   never-panicking decoder) and the RFC 4120 message set (Ticket, AS/TGS
 //!   REQ+REP, KRB-ERROR, PA-DATA). [`client`] assembles AS-REQ / TGS-REQ and
-//!   parses the KDC's reply.
+//!   parses the KDC's reply — including the AP exchange (AP-REQ builder + AP-REP
+//!   mutual-auth verification), EncKDCRepPart nonce anti-replay, ETYPE-INFO2
+//!   `s2kparams`, and RFC 6806 cross-realm referral detection + credential
+//!   lifecycle (renew/validate).
+//! - Higher protocol layers: [`gss`] (RFC 4121 krb5-gss context token + MIC +
+//!   Wrap), [`spnego`] (RFC 4178 negotiation), [`kkdcp`] (MS-KKDCP HTTPS proxy
+//!   container), [`kpasswd`] (RFC 3244 change/set-password + a KRB-PRIV codec),
+//!   and [`fast`] (RFC 6113 FAST wire codec + KRB-FX-CF2 armor-key math — the
+//!   end-to-end AES-SHA1 PRF + a live-DC round-trip are the remaining gap; see
+//!   the module docs).
 //!
 //! This is the crate that replaces `picky-krb` inside ADhammer's Kerberos stack.
 //! Offensive compositions (golden / silver / diamond / S4U-abuse / PKINIT-relay)
