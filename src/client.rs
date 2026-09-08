@@ -368,6 +368,15 @@ pub fn build_tgs_req(
     )
 }
 
+/// Default TGS-REQ `KDCOptions`: forwardable (bit 1) + renewable (bit 8) + **canonicalize**
+/// (bit 15). Canonicalize is on by default, so a TGS-REQ for a service in another realm gets
+/// a referral TGT out of the box (RFC 6806) — chase it with [`referral_realm`].
+const DEFAULT_TGS_KDC_OPTIONS: u32 = 0x4081_0000;
+/// `KDCOptions` CANONICALIZE (bit 15) — canonicalize the principal and issue realm
+/// **referrals** (RFC 6806). Included in [`DEFAULT_TGS_KDC_OPTIONS`]; exposed so a caller can
+/// set/clear it explicitly via [`build_tgs_req_with_options`].
+pub const KDC_OPT_CANONICALIZE: u32 = 0x0001_0000;
+
 /// Deterministic-confounder form of [`build_tgs_req`]. `confounder` must be the session key's
 /// [`crate::keys::Enctype::confounder_len`] (16 for AES, 8 for RC4). **Production code uses
 /// [`build_tgs_req`]** (CSPRNG confounder); a reused/predictable one weakens the authenticator.
@@ -386,13 +395,50 @@ pub fn build_tgs_req_with_confounder(
     cusec: i32,
     confounder: &[u8],
 ) -> Result<Vec<u8>, crate::keys::KeyError> {
+    build_tgs_req_with_options(
+        realm,
+        sname,
+        tgt,
+        tgt_session_key,
+        crealm,
+        cname,
+        nonce,
+        till,
+        etypes,
+        ctime,
+        cusec,
+        DEFAULT_TGS_KDC_OPTIONS,
+        confounder,
+    )
+}
+
+/// Deterministic-confounder TGS-REQ with an explicit `kdc_options` value — the etype-generic
+/// core of [`build_tgs_req`]. Use this to set/clear specific `KDCOptions` bits (e.g. to add
+/// FORWARDED for delegation, or clear [`KDC_OPT_CANONICALIZE`]); [`DEFAULT_TGS_KDC_OPTIONS`]
+/// reproduces [`build_tgs_req`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_tgs_req_with_options(
+    realm: &str,
+    sname: &PrincipalName,
+    tgt: &Ticket,
+    tgt_session_key: &crate::keys::KerberosKey,
+    crealm: &str,
+    cname: &PrincipalName,
+    nonce: u32,
+    till: &str,
+    etypes: &[i32],
+    ctime: &str,
+    cusec: i32,
+    kdc_options: u32,
+    confounder: &[u8],
+) -> Result<Vec<u8>, crate::keys::KeyError> {
     let enctype = tgt_session_key.enctype();
     let cksumtype = enctype
         .authenticator_cksumtype()
         .ok_or(crate::keys::KeyError::UnsupportedEnctype(enctype.to_i32()))?;
     // TGS-REQ omits cname in the body (identity comes from the ticket).
     let body = KdcReqBody {
-        kdc_options: 0x4081_0000,
+        kdc_options,
         cname: None,
         realm: realm.to_string(),
         sname: Some(sname.clone()),
@@ -427,6 +473,34 @@ pub fn build_tgs_req_with_confounder(
         req_body: body,
     }
     .encode())
+}
+
+/// Cross-realm **referral** detection (RFC 6806). Given the `sname` from a decrypted
+/// `EncKDCRepPart` ([`parse_enc_kdc_rep_part`]) and the service you actually requested,
+/// return `Some(next_realm)` when the KDC handed back a referral TGT (`krbtgt/<REALM>`)
+/// instead of the service ticket — i.e. the reply is a `krbtgt` for a realm that is *not*
+/// the one you asked a real (non-krbtgt) service in. Return `None` when the reply is the
+/// service ticket (chase complete) or a same-realm TGT.
+///
+/// Realm comparison is ASCII-case-insensitive (Kerberos realms are case-sensitive in the
+/// RFC but AD treats them case-insensitively; callers targeting strict realms can compare
+/// the returned value themselves).
+pub fn referral_realm(
+    rep_sname: &PrincipalName,
+    requested_sname: &PrincipalName,
+) -> Option<String> {
+    // The reply must be a TGT: name-string == ["krbtgt", <REALM>].
+    let next = match rep_sname.name_string.as_slice() {
+        [svc, realm] if svc.eq_ignore_ascii_case("krbtgt") => realm.clone(),
+        _ => return None,
+    };
+    // If we *asked* for that same krbtgt (a normal TGS-for-TGT), it is not a referral.
+    if let [svc, realm] = requested_sname.name_string.as_slice() {
+        if svc.eq_ignore_ascii_case("krbtgt") && realm.eq_ignore_ascii_case(&next) {
+            return None;
+        }
+    }
+    Some(next)
 }
 
 // ── AP exchange (application authentication, RFC 4120 §5.5) ───────────────────
@@ -805,6 +879,78 @@ mod tests {
         assert_eq!(entries[1].s2kparams, None);
         assert_eq!(entries[1].s2k_iterations(), None);
         assert_eq!(entries[2].s2k_iterations(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn referral_realm_detection() {
+        let krbtgt = |realm: &str| PrincipalName {
+            name_type: 2,
+            name_string: vec!["krbtgt".into(), realm.into()],
+        };
+        let svc = PrincipalName {
+            name_type: 2,
+            name_string: vec!["cifs".into(), "fs.b.example.com".into()],
+        };
+        // Asked for a service in realm B, got a referral TGT for realm B => chase to B.
+        assert_eq!(
+            referral_realm(&krbtgt("B.EXAMPLE.COM"), &svc).as_deref(),
+            Some("B.EXAMPLE.COM")
+        );
+        // Reply IS the service ticket => done, no referral.
+        assert_eq!(referral_realm(&svc, &svc), None);
+        // Normal TGS-for-TGT (asked for krbtgt/B, got krbtgt/B) => not a referral.
+        assert_eq!(
+            referral_realm(&krbtgt("B.EXAMPLE.COM"), &krbtgt("B.EXAMPLE.COM")),
+            None
+        );
+        // Case-insensitive realm match on the "same krbtgt" guard.
+        assert_eq!(
+            referral_realm(&krbtgt("b.example.com"), &krbtgt("B.EXAMPLE.COM")),
+            None
+        );
+    }
+
+    #[test]
+    fn default_tgs_req_sets_canonicalize_and_options_can_clear_it() {
+        // Sanity: the default options constant carries CANONICALIZE (referrals out of the box).
+        assert_eq!(
+            DEFAULT_TGS_KDC_OPTIONS & KDC_OPT_CANONICALIZE,
+            KDC_OPT_CANONICALIZE
+        );
+        let conf = [0u8; 16];
+        let default = build_tgs_req_with_confounder(
+            "EXAMPLE.COM",
+            &svc_sname(),
+            &sample_tgt(),
+            &sample_sk(),
+            "EXAMPLE.COM",
+            &client_cname("alice"),
+            1,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+            &conf,
+        )
+        .unwrap();
+        // Explicitly clearing CANONICALIZE via _with_options must change the encoded body.
+        let no_canon = build_tgs_req_with_options(
+            "EXAMPLE.COM",
+            &svc_sname(),
+            &sample_tgt(),
+            &sample_sk(),
+            "EXAMPLE.COM",
+            &client_cname("alice"),
+            1,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+            DEFAULT_TGS_KDC_OPTIONS & !KDC_OPT_CANONICALIZE,
+            &conf,
+        )
+        .unwrap();
+        assert_ne!(default, no_canon);
     }
 
     #[test]
