@@ -1,6 +1,6 @@
 [package]
 name = "kerbcore"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -11,9 +11,9 @@ documentation = "https://docs.rs/kerbcore"
 readme = "README.md"
 
 # STATUS: crypto + DER/RFC4120 codec + AS/TGS client complete; live-validated AS+TGS
-# vs Server 2019/2022/2025; total DER decoder fuzz-clean (6.4B runs). First public
-# release `0.1.0`: API is pre-1.0 and may change (typed-key enctype dispatch lands
-# in 0.2.0). No GitHub mirror yet — `repository` returns once icedracon/kerbcore exists.
+# vs Server 2019/2022/2025; total DER decoder fuzz-clean (6.4B runs). Published on
+# crates.io; API is pre-1.0 and may change (typed-key enctype dispatch lands in 0.2.0).
+# No GitHub mirror yet — `repository` returns once the public repo exists.
 
 [dependencies]
 # RFC 3962 AES-CTS uses the block-level API only; CBC + CTS wrap is hand-rolled.
