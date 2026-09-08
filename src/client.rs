@@ -110,6 +110,28 @@ pub struct EtypeInfo2Entry {
     pub etype: i32,
     /// The salt for `string-to-key` (absent → use the default realm+principal salt).
     pub salt: Option<String>,
+    /// `s2kparams` (RFC 4120 §5.2.7.5) — cryptosystem-specific string-to-key parameters.
+    /// For the AES profiles (RFC 3962 §4 / RFC 8009 §4) this is a 4-octet big-endian PBKDF2
+    /// iteration count; absent means the profile default (4096 for RFC 3962). See
+    /// [`Self::s2k_iterations`].
+    pub s2kparams: Option<Vec<u8>>,
+}
+
+impl EtypeInfo2Entry {
+    /// The PBKDF2 iteration count the KDC asks for, decoded from `s2kparams` for the AES
+    /// profiles: a 4-octet big-endian count, where `0x0000_0000` means 2^32 (RFC 3962 §4).
+    /// `None` when `s2kparams` is absent (use the profile default) or not 4 octets.
+    pub fn s2k_iterations(&self) -> Option<u32> {
+        match self.s2kparams.as_deref() {
+            Some([a, b, c, d]) => {
+                let n = u32::from_be_bytes([*a, *b, *c, *d]);
+                // 0 denotes 2^32; callers cap this. Report u32::MAX as the closest value so a
+                // hostile huge count can be clamped rather than looping 4 billion times.
+                Some(if n == 0 { u32::MAX } else { n })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Parse `ETYPE-INFO2 ::= SEQUENCE OF ETYPE-INFO2-ENTRY` from a PA-DATA value.
@@ -132,7 +154,17 @@ pub fn parse_etype_info2(padata_value: &[u8]) -> Result<Vec<EtypeInfo2Entry>, De
         } else {
             None
         };
-        out.push(EtypeInfo2Entry { etype, salt });
+        let s2kparams = if er.peek_tag() == Some(context_tag(2)) {
+            let c = er.expect(context_tag(2))?;
+            Some(one_or(c, crate::der::TAG_OCTET_STRING)?.to_vec())
+        } else {
+            None
+        };
+        out.push(EtypeInfo2Entry {
+            etype,
+            salt,
+            s2kparams,
+        });
     }
     Ok(out)
 }
@@ -157,6 +189,74 @@ pub fn enc_kdc_rep_part_session_key(
     let mut sr = Der::new(seq);
     let key_der = sr.expect(context_tag(0))?;
     crate::types::EncryptionKey::decode(key_der)
+}
+
+/// The fields of an `EncKDCRepPart` (RFC 4120 §5.4.2) kerbcore surfaces — enough to bind the
+/// reply to the request (`nonce`) and know what was issued (`srealm`/`sname`/`endtime`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncKdcRepPart {
+    /// The session key.
+    pub key: crate::types::EncryptionKey,
+    /// The nonce echoed from the request — MUST equal the request nonce (anti-replay).
+    pub nonce: u32,
+    /// Ticket expiry.
+    pub endtime: String,
+    /// Service realm the ticket is for.
+    pub srealm: String,
+    /// Service principal the ticket is for.
+    pub sname: PrincipalName,
+}
+
+fn skip_opt(r: &mut Der<'_>, n: u8) -> Result<(), DerError> {
+    if r.peek_tag() == Some(context_tag(n)) {
+        r.expect(context_tag(n))?;
+    }
+    Ok(())
+}
+
+/// Parse an `EncKDCRepPart` ([APP 25] `EncASRepPart` / [APP 26] `EncTGSRepPart`), returning
+/// the session key **and the echoed nonce** so the caller can reject a replayed/mismatched
+/// reply ([`verify_kdc_rep`]). Total: malformed input errors, never panics.
+pub fn parse_enc_kdc_rep_part(plaintext: &[u8]) -> Result<EncKdcRepPart, DerError> {
+    let mut r = Der::new(plaintext);
+    let (tag, inner) = r.read_tlv()?;
+    if tag != application_tag(25) && tag != application_tag(26) {
+        return Err(DerError::TagMismatch {
+            expected: application_tag(25),
+            found: tag,
+        });
+    }
+    let seq = one_or(inner, TAG_SEQUENCE)?;
+    let mut sr = Der::new(seq);
+    let key = crate::types::EncryptionKey::decode(sr.expect(context_tag(0))?)?;
+    let _last_req = sr.expect(context_tag(1))?; // [1] last-req (required) — not surfaced
+    let nonce = crate::der::read_u32(sr.expect(context_tag(2))?)?;
+    skip_opt(&mut sr, 3)?; // key-expiration OPTIONAL
+    let _flags = sr.expect(context_tag(4))?; // [4] flags
+    let _authtime = sr.expect(context_tag(5))?; // [5] authtime
+    skip_opt(&mut sr, 6)?; // starttime OPTIONAL
+    let endtime = KerberosTime::decode(sr.expect(context_tag(7))?)?.0;
+    skip_opt(&mut sr, 8)?; // renew-till OPTIONAL
+    let srealm = crate::types::decode_realm(sr.expect(context_tag(9))?)?;
+    let sname = PrincipalName::decode(sr.expect(context_tag(10))?)?;
+    Ok(EncKdcRepPart {
+        key,
+        nonce,
+        endtime,
+        srealm,
+        sname,
+    })
+}
+
+/// Anti-replay check: confirm a decrypted `EncKDCRepPart` echoes the nonce we sent. Returns
+/// the parsed part on success, or [`DerError::MsgTypeMismatch`] when the nonce differs (a
+/// replayed or substituted reply).
+pub fn verify_kdc_rep(plaintext: &[u8], expected_nonce: u32) -> Result<EncKdcRepPart, DerError> {
+    let part = parse_enc_kdc_rep_part(plaintext)?;
+    if part.nonce != expected_nonce {
+        return Err(DerError::MsgTypeMismatch);
+    }
+    Ok(part)
 }
 
 /// Build the `PA-ENC-TIMESTAMP` padata from an already-encrypted timestamp.
@@ -475,5 +575,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, crate::keys::KeyError::UnsupportedEnctype(20)));
+    }
+
+    /// Build a minimal but structurally-valid `[APPLICATION 25] EncASRepPart` for the
+    /// round-trip tests below.
+    fn sample_enc_as_rep_part(nonce: u32) -> Vec<u8> {
+        let key = crate::types::EncryptionKey {
+            keytype: 18,
+            keyvalue: vec![0x41u8; 32],
+        }
+        .encode();
+        let sname = PrincipalName {
+            name_type: 2,
+            name_string: vec!["krbtgt".into(), "EXAMPLE.COM".into()],
+        }
+        .encode();
+        let body = [
+            explicit(0, &key),
+            explicit(1, &encode_sequence(&[])), // last-req (contents irrelevant here)
+            explicit(2, &encode_integer(nonce as i64)),
+            explicit(4, &encode_integer(0)), // flags (discarded)
+            explicit(5, &KerberosTime("20260908000000Z".into()).encode()), // authtime
+            explicit(7, &KerberosTime("20260908100000Z".into()).encode()), // endtime
+            explicit(9, &encode_realm("EXAMPLE.COM")),
+            explicit(10, &sname),
+        ]
+        .concat();
+        tlv(application_tag(25), &encode_sequence(&body))
+    }
+
+    #[test]
+    fn enc_kdc_rep_part_extracts_nonce_and_sname() {
+        let der = sample_enc_as_rep_part(0xDEAD_BEEF);
+        let part = parse_enc_kdc_rep_part(&der).unwrap();
+        assert_eq!(part.nonce, 0xDEAD_BEEF);
+        assert_eq!(part.key.keytype, 18);
+        assert_eq!(part.endtime, "20260908100000Z");
+        assert_eq!(part.srealm, "EXAMPLE.COM");
+        assert_eq!(part.sname.name_string, vec!["krbtgt", "EXAMPLE.COM"]);
+    }
+
+    #[test]
+    fn verify_kdc_rep_matches_and_rejects_nonce() {
+        let der = sample_enc_as_rep_part(4242);
+        // Matching nonce: accepted.
+        assert_eq!(verify_kdc_rep(&der, 4242).unwrap().nonce, 4242);
+        // Mismatched nonce (a replayed/substituted reply): rejected, never panics.
+        assert!(matches!(
+            verify_kdc_rep(&der, 9999),
+            Err(DerError::MsgTypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn etype_info2_parses_salt_and_s2k_iterations() {
+        use crate::der::{encode_general_string, encode_octet_string};
+        let entry = |etype: i64, salt: &str, s2k: Option<&[u8]>| {
+            let mut b = explicit(0, &encode_integer(etype));
+            b.extend_from_slice(&explicit(1, &encode_general_string(salt)));
+            if let Some(p) = s2k {
+                b.extend_from_slice(&explicit(2, &encode_octet_string(p)));
+            }
+            encode_sequence(&b)
+        };
+        // Entry 0: AES256 with an explicit 0x0000_C000 (49152) iteration count.
+        // Entry 1: no s2kparams (profile default).
+        // Entry 2: s2kparams of 0x0000_0000 (denotes 2^32 -> reported as u32::MAX).
+        let seq = [
+            entry(18, "EXAMPLE.COMalice", Some(&[0x00, 0x00, 0xC0, 0x00])),
+            entry(17, "EXAMPLE.COMalice", None),
+            entry(18, "s", Some(&[0x00, 0x00, 0x00, 0x00])),
+        ]
+        .concat();
+        let padata = encode_sequence(&seq);
+        let entries = parse_etype_info2(&padata).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].etype, 18);
+        assert_eq!(entries[0].salt.as_deref(), Some("EXAMPLE.COMalice"));
+        assert_eq!(entries[0].s2k_iterations(), Some(49152));
+        assert_eq!(entries[1].s2kparams, None);
+        assert_eq!(entries[1].s2k_iterations(), None);
+        assert_eq!(entries[2].s2k_iterations(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn enc_kdc_rep_part_rejects_wrong_app_tag() {
+        // Wrap the same body under [APPLICATION 30] — not an EncKDCRepPart.
+        let inner = {
+            let der = sample_enc_as_rep_part(1);
+            // strip the outer app-25 TLV, re-wrap under 30
+            let mut r = Der::new(&der);
+            let (_t, body) = r.read_tlv().unwrap();
+            tlv(application_tag(30), body)
+        };
+        assert!(parse_enc_kdc_rep_part(&inner).is_err());
     }
 }
