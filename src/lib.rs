@@ -33,6 +33,7 @@
 pub mod client;
 pub mod crypto;
 pub mod der;
+pub mod fast;
 pub mod gss;
 pub mod keys;
 pub mod kkdcp;
