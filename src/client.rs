@@ -376,6 +376,15 @@ const DEFAULT_TGS_KDC_OPTIONS: u32 = 0x4081_0000;
 /// **referrals** (RFC 6806). Included in [`DEFAULT_TGS_KDC_OPTIONS`]; exposed so a caller can
 /// set/clear it explicitly via [`build_tgs_req_with_options`].
 pub const KDC_OPT_CANONICALIZE: u32 = 0x0001_0000;
+/// `KDCOptions` RENEWABLE-OK (bit 27) — accept a renewable ticket if the requested lifetime
+/// can't be met.
+pub const KDC_OPT_RENEWABLE_OK: u32 = 0x0000_0010;
+/// `KDCOptions` RENEW (bit 30) — this TGS-REQ renews the presented (renewable) ticket rather
+/// than requesting a new one (RFC 4120 §3.3, credential lifecycle).
+pub const KDC_OPT_RENEW: u32 = 0x0000_0002;
+/// `KDCOptions` VALIDATE (bit 31) — validate a postdated ticket that has reached its start
+/// time (RFC 4120 §3.3).
+pub const KDC_OPT_VALIDATE: u32 = 0x0000_0001;
 
 /// Deterministic-confounder form of [`build_tgs_req`]. `confounder` must be the session key's
 /// [`crate::keys::Enctype::confounder_len`] (16 for AES, 8 for RC4). **Production code uses
@@ -501,6 +510,42 @@ pub fn referral_realm(
         }
     }
     Some(next)
+}
+
+/// Build a TGS-REQ that **renews** a renewable TGT (RFC 4120 §3.3 credential lifecycle): the
+/// RENEW option is set, the service name is `krbtgt/<realm>`, and the ticket being renewed is
+/// presented in the PA-TGS-REQ. `till` is the requested new end time (bounded by the ticket's
+/// renew-till). Fresh CSPRNG confounder. Same etype rules as [`build_tgs_req`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_tgs_renew(
+    realm: &str,
+    renewable_tgt: &Ticket,
+    tgt_session_key: &crate::keys::KerberosKey,
+    crealm: &str,
+    cname: &PrincipalName,
+    nonce: u32,
+    till: &str,
+    etypes: &[i32],
+    ctime: &str,
+    cusec: i32,
+) -> Result<Vec<u8>, crate::keys::KeyError> {
+    let mut conf = vec![0u8; tgt_session_key.enctype().confounder_len()];
+    getrandom::getrandom(&mut conf).expect("OS CSPRNG available for Kerberos confounder");
+    build_tgs_req_with_options(
+        realm,
+        &krbtgt_sname(realm),
+        renewable_tgt,
+        tgt_session_key,
+        crealm,
+        cname,
+        nonce,
+        till,
+        etypes,
+        ctime,
+        cusec,
+        KDC_OPT_RENEW | KDC_OPT_RENEWABLE_OK,
+        &conf,
+    )
 }
 
 // ── AP exchange (application authentication, RFC 4120 §5.5) ───────────────────
@@ -951,6 +996,31 @@ mod tests {
         )
         .unwrap();
         assert_ne!(default, no_canon);
+    }
+
+    #[test]
+    fn tgs_renew_sets_renew_option_and_targets_krbtgt() {
+        // RENEW bit is 0x0000_0002; renew request must carry it and differ from a normal req.
+        assert_eq!(KDC_OPT_RENEW, 0x0000_0002);
+        let renew = build_tgs_renew(
+            "EXAMPLE.COM",
+            &sample_tgt(),
+            &sample_sk(),
+            "EXAMPLE.COM",
+            &client_cname("alice"),
+            5,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+        )
+        .unwrap();
+        // The kdc-options BIT STRING for RENEW|RENEWABLE-OK = 00 00 00 00 12 (unused-bits + flags).
+        let needle = [0x00u8, 0x00, 0x00, 0x00, 0x12];
+        assert!(
+            renew.windows(5).any(|w| w == needle),
+            "renew TGS-REQ should carry RENEW|RENEWABLE-OK flags"
+        );
     }
 
     #[test]
