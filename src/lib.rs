@@ -33,6 +33,7 @@
 pub mod client;
 pub mod crypto;
 pub mod der;
+pub mod gss;
 pub mod keys;
 pub mod messages;
 pub mod rc4;
