@@ -114,6 +114,16 @@ pub fn derive_ki(etype: Rfc8009Etype, base_key: &[u8], usage: u32) -> Vec<u8> {
     kdf(etype, base_key, &label(usage, 0x55), etype.mac_len())
 }
 
+/// RFC 8009 §5 keyed checksum (the `hmac-sha256-128-aes128` / `hmac-sha384-192-aes256`
+/// cksumtypes): `HMAC-<hash>(Kc, message)` truncated to the MAC length. Used for the
+/// TGS-REQ authenticator checksum and GSS MIC tokens under an RFC 8009 key.
+pub fn checksum(etype: Rfc8009Etype, base_key: &[u8], usage: u32, data: &[u8]) -> Vec<u8> {
+    let kc = derive_kc(etype, base_key, usage);
+    let mut mac = etype.prf(&kc, data);
+    mac.truncate(etype.mac_len());
+    mac
+}
+
 /// RFC 8009 §5.3 encrypt: `C1 = AES-CTS(Ke, conf || plaintext)`,
 /// `H = HMAC(Ki, IV || C1)[..h]`, output `C1 || H`. `confounder` is 16 bytes
 /// (one AES block); callers supply RNG bytes in production.

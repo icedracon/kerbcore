@@ -1,6 +1,6 @@
 [package]
 name = "kerbcore"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -27,6 +27,8 @@ md-5 = "0.10"
 sha2 = "0.10"
 # OS CSPRNG for the TGS-REQ authenticator confounder (must be unpredictable).
 getrandom = "0.2"
+# Zero key material on drop (0.2.0 typed-key abstraction holds session/base keys).
+zeroize = "1"
 
 [dev-dependencies]
 # Differential oracles — dev-only, NEVER runtime deps (the whole point of

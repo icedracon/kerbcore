@@ -20,20 +20,24 @@
 //! dual-use rule.
 //!
 //! ## Status
-//! `0.1.x` — the AS/TGS crypto + codec + client are complete and live-validated
+//! `0.2.x` — the AS/TGS crypto + codec + client are complete and live-validated
 //! (real TGT + service ticket) against Windows Server 2019 / 2022 / 2025. The API
-//! is pre-1.0 and may change: the enctype dispatch is being lifted into a typed
-//! `KerberosKey` abstraction in 0.2.0 (today the TGS-REQ builder targets the
-//! AES-SHA1 session-key profile AD issues; see [`client::build_tgs_req`]).
+//! is pre-1.0 and may change. `0.2.0` adds the typed [`KerberosKey`] / [`Enctype`]
+//! abstraction: one key value dispatches encrypt / decrypt / checksum / string-to-key
+//! across the whole etype matrix (17/18/19/20/23), zeroizes its bytes on drop, and never
+//! prints them via `Debug`. (The `client::build_tgs_req` wire path still targets the
+//! AES-SHA1 session-key profile AD issues; migrating it onto `KerberosKey` is next.)
 
 #![forbid(unsafe_code)]
 
 pub mod client;
 pub mod crypto;
 pub mod der;
+pub mod keys;
 pub mod messages;
 pub mod rc4;
 pub mod rfc8009;
 pub mod types;
 
 pub use crypto::*;
+pub use keys::{Enctype, KerberosKey, KeyError};
