@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kerbcore::client::{
     build_as_req, build_tgs_req, client_cname, enc_kdc_rep_part_session_key, encode_pa_enc_ts_enc,
-    krbtgt_sname, pa_enc_timestamp, parse_etype_info2, unix_to_kerberos_time, KU_AS_REP_ENC_PART,
-    KU_AS_REQ_PA_ENC_TS, KU_TGS_REP_ENC_PART, PA_ETYPE_INFO2,
+    krbtgt_sname, pa_enc_timestamp, parse_etype_info2, referral_realm, unix_to_kerberos_time,
+    verify_kdc_rep, KU_AS_REP_ENC_PART, KU_AS_REQ_PA_ENC_TS, KU_TGS_REP_ENC_PART, PA_ETYPE_INFO2,
 };
 use kerbcore::crypto::{decrypt_message, encrypt_message, string_to_key};
 use kerbcore::messages::{KdcRep, KrbError};
@@ -169,6 +169,19 @@ fn live_as_exchange() {
     assert_eq!(session_key.keytype, AES256);
     assert_eq!(session_key.keyvalue.len(), 32);
 
+    // Live receipt for the 0.2.0 EncKDCRepPart model + reply-nonce anti-replay: the AS-REP
+    // enc-part must echo the AS-REQ nonce (0x3333_4444), and a wrong nonce must be rejected.
+    let as_part = verify_kdc_rep(&plain, 0x3333_4444).expect("AS-REP nonce anti-replay");
+    assert_eq!(as_part.key.keyvalue, session_key.keyvalue);
+    assert!(
+        verify_kdc_rep(&plain, 0xDEAD_BEEF).is_err(),
+        "a mismatched nonce must be rejected"
+    );
+    eprintln!(
+        "stage 2 OK — EncASRepPart nonce echoes the request (anti-replay verified); srealm {} sname {:?}",
+        as_part.srealm, as_part.sname.name_string
+    );
+
     // ── Stage 3: TGS-REQ (AP-REQ w/ the TGT) → TGS-REP → service session key ─
     let tgt_key =
         kerbcore::KerberosKey::from_i32(session_key.keytype, session_key.keyvalue.clone())
@@ -210,4 +223,19 @@ fn live_as_exchange() {
         tgs_rep.ticket.sname.name_string, svc_key.keytype, svc_key.keyvalue.len()
     );
     assert_eq!(svc_key.keyvalue.len(), 32);
+
+    // Live receipt for TGS-REP nonce anti-replay + referral detection: the TGS-REP echoes the
+    // TGS-REQ nonce (0x5555_6666), and since we asked for krbtgt/<realm> the reply is the TGT
+    // itself — referral_realm() must report None (a same-realm TGT, not a cross-realm referral).
+    let tgs_part = verify_kdc_rep(&tgs_plain, 0x5555_6666).expect("TGS-REP nonce anti-replay");
+    assert_eq!(tgs_part.key.keyvalue, svc_key.keyvalue);
+    assert_eq!(
+        referral_realm(&tgs_part.sname, &krbtgt_sname(&realm)),
+        None,
+        "a same-realm krbtgt reply is not a referral"
+    );
+    eprintln!(
+        "stage 3 OK — TGS-REP nonce echoes the request; referral_realm=None for the same-realm TGT (sname {:?}).",
+        tgs_part.sname.name_string
+    );
 }
