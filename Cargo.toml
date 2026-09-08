@@ -9,6 +9,8 @@ keywords = ["kerberos", "rfc3961", "rfc3962", "authentication", "crypto"]
 categories = ["cryptography", "authentication", "parser-implementations"]
 documentation = "https://docs.rs/kerbcore"
 readme = "README.md"
+# Internal dev tooling — never part of the published crate.
+exclude = [".githooks/*", ".gitignore"]
 
 # STATUS: crypto + DER/RFC4120 codec + AS/TGS client complete; live-validated AS+TGS
 # vs Server 2019/2022/2025; total DER decoder fuzz-clean (6.4B runs). Published on
