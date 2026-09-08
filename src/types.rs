@@ -154,7 +154,7 @@ impl EncryptedData {
         let mut r = Der::new(body);
         let etype = read_i32(r.expect(context_tag(0))?)?;
         let kvno = if r.peek_tag() == Some(context_tag(1)) {
-            Some(read_i32(r.expect(context_tag(1))?)? as u32)
+            Some(crate::der::read_u32(r.expect(context_tag(1))?)?)
         } else {
             None
         };

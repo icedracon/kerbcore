@@ -219,9 +219,25 @@ fn encode_ap_req(ticket_der: &[u8], enc_auth: &EncryptedData) -> Vec<u8> {
     tlv(application_tag(14), &encode_sequence(&body))
 }
 
+/// Draw a fresh 16-byte Kerberos confounder from the OS CSPRNG. A confounder must be
+/// unpredictable per RFC 8009 §3 / RFC 3961 §5.3 — a fixed one leaks plaintext structure
+/// across sealed authenticators. Panics only if the OS RNG is unavailable (a broken host).
+fn random_confounder() -> [u8; crate::crypto::CONFOUNDER_LEN] {
+    let mut c = [0u8; crate::crypto::CONFOUNDER_LEN];
+    getrandom::getrandom(&mut c).expect("OS CSPRNG available for Kerberos confounder");
+    c
+}
+
 /// Build a TGS-REQ for `sname`, authenticated by `tgt` + `tgt_session_key` (from the
 /// AS exchange). The authenticator's checksum covers the KDC-REQ-BODY (usage 6) and
-/// the authenticator itself is encrypted under the TGT session key (usage 7).
+/// the authenticator itself is encrypted under the TGT session key (usage 7), with a
+/// **fresh random confounder** drawn from the OS CSPRNG.
+///
+/// LIMITATION (0.1.x): this targets the AES-SHA1 session-key profile — cksumtype 16,
+/// etype 18, the profile every Active Directory KDC issues for the TGT session key.
+/// RC4 / RFC 8009 TGT session keys need the typed-key enctype dispatch planned for
+/// 0.2.0. For deterministic output (tests, differential vectors) use
+/// [`build_tgs_req_with_confounder`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_tgs_req(
     realm: &str,
@@ -235,6 +251,42 @@ pub fn build_tgs_req(
     etypes: &[i32],
     ctime: &str,
     cusec: i32,
+) -> Vec<u8> {
+    build_tgs_req_with_confounder(
+        realm,
+        sname,
+        tgt,
+        tgt_session_key,
+        crealm,
+        cname,
+        nonce,
+        till,
+        etypes,
+        ctime,
+        cusec,
+        &random_confounder(),
+    )
+}
+
+/// Deterministic-confounder form of [`build_tgs_req`]. Callers pass the 16-byte
+/// authenticator confounder explicitly — for reproducible test/differential vectors,
+/// or to hand the same value to a peer implementation. **Production code must use
+/// [`build_tgs_req`]**, which draws the confounder from the OS CSPRNG; a reused or
+/// predictable confounder weakens the sealed authenticator.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tgs_req_with_confounder(
+    realm: &str,
+    sname: &PrincipalName,
+    tgt: &Ticket,
+    tgt_session_key: &[u8],
+    crealm: &str,
+    cname: &PrincipalName,
+    nonce: u32,
+    till: &str,
+    etypes: &[i32],
+    ctime: &str,
+    cusec: i32,
+    confounder: &[u8; crate::crypto::CONFOUNDER_LEN],
 ) -> Vec<u8> {
     // TGS-REQ omits cname in the body (identity comes from the ticket).
     let body = KdcReqBody {
@@ -257,11 +309,10 @@ pub fn build_tgs_req(
         checksum: aes_checksum(tgt_session_key, KU_TGS_REQ_AUTH_CKSUM, &body_der),
     };
     let auth = encode_authenticator(crealm, cname, cusec, ctime, Some(&cksum));
-    let conf: [u8; 16] = std::array::from_fn(|i| 0x5a ^ i as u8);
     let enc_auth = EncryptedData {
         etype: 18,
         kvno: None,
-        cipher: crate::crypto::encrypt_message(tgt_session_key, KU_TGS_REQ_AUTH, &conf, &auth),
+        cipher: crate::crypto::encrypt_message(tgt_session_key, KU_TGS_REQ_AUTH, confounder, &auth),
     };
     let ap_req = encode_ap_req(&tgt.encode(), &enc_auth);
     let padata = vec![PaData {
@@ -311,5 +362,107 @@ mod tests {
         let req = KdcReq::decode(&der).unwrap();
         assert_eq!(req.req_body.sname.unwrap(), krbtgt_sname("EXAMPLE.COM"));
         assert_eq!(req.req_body.etypes, vec![18, 17]);
+    }
+
+    fn sample_tgt() -> Ticket {
+        Ticket {
+            tkt_vno: 5,
+            realm: "EXAMPLE.COM".into(),
+            sname: krbtgt_sname("EXAMPLE.COM"),
+            enc_part: crate::types::EncryptedData {
+                etype: 18,
+                kvno: Some(2),
+                cipher: vec![0u8; 32],
+            },
+        }
+    }
+
+    fn svc_sname() -> PrincipalName {
+        PrincipalName {
+            name_type: NT_SRV_INST,
+            name_string: vec!["host".into(), "dc.example.com".into()],
+        }
+    }
+
+    #[test]
+    fn tgs_req_uses_fresh_random_confounder() {
+        // Two TGS-REQs with byte-identical inputs must differ — the confounder is
+        // drawn from the OS CSPRNG per call. (Regression guard against the old fixed
+        // `0x5a ^ i` confounder.)
+        let (tgt, sk, sname, cname) = (
+            sample_tgt(),
+            [0x11u8; 32],
+            svc_sname(),
+            client_cname("alice"),
+        );
+        let a = build_tgs_req(
+            "EXAMPLE.COM",
+            &sname,
+            &tgt,
+            &sk,
+            "EXAMPLE.COM",
+            &cname,
+            1,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+        );
+        let b = build_tgs_req(
+            "EXAMPLE.COM",
+            &sname,
+            &tgt,
+            &sk,
+            "EXAMPLE.COM",
+            &cname,
+            1,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+        );
+        assert_ne!(a, b, "TGS-REQ must use a fresh random confounder each call");
+    }
+
+    #[test]
+    fn tgs_req_with_confounder_is_deterministic() {
+        let (tgt, sk, sname, cname) = (
+            sample_tgt(),
+            [0x11u8; 32],
+            svc_sname(),
+            client_cname("alice"),
+        );
+        let conf = [0x24u8; 16];
+        let a = build_tgs_req_with_confounder(
+            "EXAMPLE.COM",
+            &sname,
+            &tgt,
+            &sk,
+            "EXAMPLE.COM",
+            &cname,
+            1,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+            &conf,
+        );
+        let b = build_tgs_req_with_confounder(
+            "EXAMPLE.COM",
+            &sname,
+            &tgt,
+            &sk,
+            "EXAMPLE.COM",
+            &cname,
+            1,
+            "20370913024805Z",
+            &[18],
+            "20240102030405Z",
+            0,
+            &conf,
+        );
+        assert_eq!(a, b, "same confounder + inputs must be byte-identical");
+        // And the result is a well-formed TGS-REQ ([APPLICATION 12]).
+        assert_eq!(KdcReq::decode(&a).unwrap().msg_type, 12);
     }
 }

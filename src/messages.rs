@@ -40,9 +40,14 @@ fn encode_flags(flags: u32) -> Vec<u8> {
 }
 fn decode_flags(der: &[u8]) -> Result<u32, DerError> {
     let c = one(der, TAG_BIT_STRING)?;
-    let data = c.get(1..).ok_or(DerError::Truncated)?; // drop the unused-bits octet
+    // `KerberosFlags` is a fixed 32-bit BIT STRING: exactly one unused-bits octet
+    // (which must be 0) followed by exactly four flag octets. Reject anything else
+    // rather than silently truncating/ignoring extra bytes.
+    if c.len() != 5 || c[0] != 0 {
+        return Err(DerError::BadBitString);
+    }
     let mut v = 0u32;
-    for &b in data.iter().take(4) {
+    for &b in &c[1..5] {
         v = (v << 8) | b as u32;
     }
     Ok(v)
@@ -114,6 +119,9 @@ impl Ticket {
         let seq = one(one(der, application_tag(1))?, TAG_SEQUENCE)?;
         let mut r = Der::new(seq);
         let tkt_vno = read_i32(r.expect(context_tag(0))?)?;
+        if tkt_vno != 5 {
+            return Err(DerError::BadProtocolVersion);
+        }
         let realm = decode_realm(r.expect(context_tag(1))?)?;
         let sname = PrincipalName::decode(r.expect(context_tag(2))?)?;
         let enc_part = EncryptedData::decode(r.expect(context_tag(3))?)?;
@@ -203,11 +211,11 @@ impl KdcReqBody {
         let from = opt(&mut r, 4, KerberosTime::decode)?;
         let till = KerberosTime::decode(r.expect(context_tag(5))?)?;
         let rtime = opt(&mut r, 6, KerberosTime::decode)?;
-        let nonce = read_i32(r.expect(context_tag(7))?)? as u32;
+        let nonce = crate::der::read_u32(r.expect(context_tag(7))?)?;
         let etypes = decode_int_seq(r.expect(context_tag(8))?)?;
-        let addresses = opt_raw(&mut r, 9);
-        let enc_authorization_data = opt_raw(&mut r, 10);
-        let additional_tickets = opt_raw(&mut r, 11);
+        let addresses = opt_raw(&mut r, 9)?;
+        let enc_authorization_data = opt_raw(&mut r, 10)?;
+        let additional_tickets = opt_raw(&mut r, 11)?;
         r.finish()?;
         Ok(KdcReqBody {
             kdc_options,
@@ -238,12 +246,14 @@ fn opt<T>(
         Ok(None)
     }
 }
-/// Read an OPTIONAL `[n]` field as raw inner DER bytes.
-fn opt_raw(r: &mut Der<'_>, n: u8) -> Option<Vec<u8>> {
+/// Read an OPTIONAL `[n]` field as raw inner DER bytes. A structural parse error
+/// (e.g. the tag is present but its length is truncated) propagates as `Err` — it
+/// must never be silently downgraded to "field absent".
+fn opt_raw(r: &mut Der<'_>, n: u8) -> Result<Option<Vec<u8>>, DerError> {
     if r.peek_tag() == Some(context_tag(n)) {
-        r.expect(context_tag(n)).ok().map(|b| b.to_vec())
+        Ok(Some(r.expect(context_tag(n))?.to_vec()))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -288,11 +298,18 @@ impl KdcReq {
                 })
             }
         })?;
-        let _ = app;
         let seq = one(inner, TAG_SEQUENCE)?;
         let mut r = Der::new(seq);
-        let _pvno = read_i32(r.expect(context_tag(1))?)?;
+        let pvno = read_i32(r.expect(context_tag(1))?)?;
+        if pvno != 5 {
+            return Err(DerError::BadProtocolVersion);
+        }
         let msg_type = read_i32(r.expect(context_tag(2))?)?;
+        // The inner msg-type must match the outer [APPLICATION n] tag.
+        let expected = if app == application_tag(10) { 10 } else { 12 };
+        if msg_type != expected {
+            return Err(DerError::MsgTypeMismatch);
+        }
         let padata = match opt(&mut r, 3, |b| Ok::<_, DerError>(b.to_vec()))? {
             Some(raw) => decode_padata_seq(&raw)?,
             None => Vec::new(),
@@ -345,7 +362,7 @@ impl KdcRep {
     }
     /// Parse an AS-REP or TGS-REP.
     pub fn decode(der: &[u8]) -> Result<Self, DerError> {
-        let (_, inner) = Der::new(der).read_tlv().and_then(|(t, c)| {
+        let (app, inner) = Der::new(der).read_tlv().and_then(|(t, c)| {
             if t == application_tag(11) || t == application_tag(13) {
                 Ok((t, c))
             } else {
@@ -357,8 +374,15 @@ impl KdcRep {
         })?;
         let seq = one(inner, TAG_SEQUENCE)?;
         let mut r = Der::new(seq);
-        let _pvno = read_i32(r.expect(context_tag(0))?)?;
+        let pvno = read_i32(r.expect(context_tag(0))?)?;
+        if pvno != 5 {
+            return Err(DerError::BadProtocolVersion);
+        }
         let msg_type = read_i32(r.expect(context_tag(1))?)?;
+        let expected = if app == application_tag(11) { 11 } else { 13 };
+        if msg_type != expected {
+            return Err(DerError::MsgTypeMismatch);
+        }
         let padata = match opt(&mut r, 2, |b| Ok::<_, DerError>(b.to_vec()))? {
             Some(raw) => decode_padata_seq(&raw)?,
             None => Vec::new(),
@@ -423,8 +447,14 @@ impl KrbError {
     pub fn decode(der: &[u8]) -> Result<Self, DerError> {
         let seq = one(one(der, application_tag(30))?, TAG_SEQUENCE)?;
         let mut r = Der::new(seq);
-        let _pvno = read_i32(r.expect(context_tag(0))?)?;
-        let _msg_type = read_i32(r.expect(context_tag(1))?)?;
+        let pvno = read_i32(r.expect(context_tag(0))?)?;
+        if pvno != 5 {
+            return Err(DerError::BadProtocolVersion);
+        }
+        let msg_type = read_i32(r.expect(context_tag(1))?)?;
+        if msg_type != 30 {
+            return Err(DerError::MsgTypeMismatch);
+        }
         // ctime [2] / cusec [3] are OPTIONAL — skip if present.
         let _ = opt(&mut r, 2, |b| Ok::<_, DerError>(b.to_vec()))?;
         let _ = opt(&mut r, 3, |b| Ok::<_, DerError>(b.to_vec()))?;
@@ -636,5 +666,80 @@ mod tests {
             assert!(KdcRep::decode(bad).is_err());
             assert!(KrbError::decode(bad).is_err());
         }
+    }
+
+    // ── Strict-decode negative tests (protocol-correctness invariants) ────
+    fn sample_req_body() -> KdcReqBody {
+        KdcReqBody {
+            kdc_options: 0x40810010,
+            cname: Some(sample_princ()),
+            realm: "EXAMPLE.COM".into(),
+            sname: Some(sample_svc()),
+            from: None,
+            till: KerberosTime("20370913024805Z".into()),
+            rtime: None,
+            nonce: 1,
+            etypes: vec![18],
+            addresses: None,
+            enc_authorization_data: None,
+            additional_tickets: None,
+        }
+    }
+
+    #[test]
+    fn kdc_req_rejects_app_tag_msg_type_mismatch() {
+        // [APPLICATION 10] (AS-REQ) wrapping an inner msg-type of 12 (TGS-REQ).
+        let inner = encode_sequence(
+            &[
+                explicit(1, &encode_integer(5)),  // pvno
+                explicit(2, &encode_integer(12)), // msg-type 12 ≠ app 10
+                explicit(4, &sample_req_body().encode()),
+            ]
+            .concat(),
+        );
+        let der = tlv(application_tag(10), &inner);
+        assert_eq!(KdcReq::decode(&der), Err(DerError::MsgTypeMismatch));
+    }
+
+    #[test]
+    fn kdc_req_rejects_bad_pvno() {
+        let inner = encode_sequence(
+            &[
+                explicit(1, &encode_integer(6)), // pvno 6 ≠ 5
+                explicit(2, &encode_integer(10)),
+                explicit(4, &sample_req_body().encode()),
+            ]
+            .concat(),
+        );
+        let der = tlv(application_tag(10), &inner);
+        assert_eq!(KdcReq::decode(&der), Err(DerError::BadProtocolVersion));
+    }
+
+    #[test]
+    fn ticket_rejects_bad_tkt_vno() {
+        let mut t = sample_ticket();
+        t.tkt_vno = 4;
+        assert_eq!(
+            Ticket::decode(&t.encode()),
+            Err(DerError::BadProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn kdc_req_body_rejects_noncanonical_flags() {
+        // [0] flags as a 4-octet (not the canonical 5-octet) BIT STRING.
+        let bad = encode_sequence(&explicit(0, &tlv(TAG_BIT_STRING, &[0x00, 0, 0, 0])));
+        assert_eq!(KdcReqBody::decode(&bad), Err(DerError::BadBitString));
+    }
+
+    #[test]
+    fn kdc_req_body_rejects_truncated_trailing_optional() {
+        // A well-formed body with a stray, truncated [9] tag appended must ERROR —
+        // not be silently downgraded to "addresses absent" by opt_raw.
+        let good = sample_req_body().encode();
+        let inner = one(&good, TAG_SEQUENCE).unwrap();
+        let mut corrupt = inner.to_vec();
+        corrupt.push(context_tag(9)); // 0xA9 tag with no length/content
+        assert!(KdcReqBody::decode(&encode_sequence(&corrupt)).is_err());
     }
 }

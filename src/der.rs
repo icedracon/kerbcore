@@ -118,10 +118,16 @@ pub enum DerError {
     BadLength,
     /// A tag did not match what the caller required.
     TagMismatch { expected: u8, found: u8 },
-    /// INTEGER wider than an `i64`.
+    /// INTEGER wider than an `i64`, or outside the range a `UInt32` field allows.
     IntTooLarge,
     /// Bytes remained after the value the caller expected to be complete.
     TrailingData,
+    /// A `pvno` / `tkt-vno` field was not 5 (the only Kerberos v5 version).
+    BadProtocolVersion,
+    /// The outer `[APPLICATION n]` tag and the inner `msg-type` disagree.
+    MsgTypeMismatch,
+    /// A `KerberosFlags` BIT STRING was not the canonical 5 octets / 0 unused bits.
+    BadBitString,
 }
 
 impl core::fmt::Display for DerError {
@@ -135,8 +141,11 @@ impl core::fmt::Display for DerError {
                     "DER: tag mismatch (expected 0x{expected:02x}, found 0x{found:02x})"
                 )
             }
-            Self::IntTooLarge => write!(f, "DER: INTEGER exceeds i64"),
+            Self::IntTooLarge => write!(f, "DER: INTEGER out of range"),
             Self::TrailingData => write!(f, "DER: unexpected trailing data"),
+            Self::BadProtocolVersion => write!(f, "DER: pvno/tkt-vno is not 5"),
+            Self::MsgTypeMismatch => write!(f, "DER: application tag disagrees with msg-type"),
+            Self::BadBitString => write!(f, "DER: non-canonical KerberosFlags BIT STRING"),
         }
     }
 }
@@ -149,6 +158,17 @@ pub fn one_or(der: &[u8], tag: u8) -> Result<&[u8], DerError> {
     let content = r.expect(tag)?;
     r.finish()?;
     Ok(content)
+}
+
+/// Read a single `INTEGER` element as an RFC 4120 `UInt32`: the value must be in
+/// `[0, 2^32 - 1]`. Rejects a negative INTEGER (which a naive `as u32` would wrap to
+/// a huge value) and accepts the full unsigned range (which `i32` decoding would
+/// reject above `i32::MAX`). Used for `nonce` and `kvno`.
+pub fn read_u32(der: &[u8]) -> Result<u32, DerError> {
+    let mut r = Der::new(der);
+    let v = r.read_integer()?;
+    r.finish()?;
+    u32::try_from(v).map_err(|_| DerError::IntTooLarge)
 }
 
 /// A cursor over a DER buffer. Borrows the input; returned slices are sub-borrows.

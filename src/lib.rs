@@ -1,20 +1,30 @@
 //! # kerbcore
 //!
-//! Pure-Rust Kerberos building blocks — no FFI, no dependency on a host krb5.
+//! Pure-Rust Kerberos building blocks — no FFI, no dependency on a host krb5,
+//! `#![forbid(unsafe_code)]`. Three layers, each cross-checked against RFC
+//! known-answer vectors and (for the codec) a differential re-encode oracle:
 //!
-//! **Spike status (1.5.1):** this first cut ships only the RFC 3961 / RFC 3962
-//! crypto for the `aes256-cts-hmac-sha1-96` profile (etype 18) — n-fold, AES
-//! CBC-CTS, DR/DK key derivation, HMAC-SHA1-96, RFC 3961 §5.3 subkey derivation,
-//! and the generic encrypt-then-MAC primitive. It is KAT-verified against the
-//! RFC 3961 n-fold vector and round-trips across the CTS edge lengths.
+//! - [`crypto`] — RFC 3961 / 3962 AES-CTS-HMAC-SHA1 (etypes 17 & 18): n-fold,
+//!   AES CBC-CTS, DR/DK, HMAC-SHA1-96, subkey derivation, PBKDF2 string-to-key,
+//!   and the generic encrypt-then-integrity primitive.
+//! - [`rfc8009`] — RFC 8009 AES-SHA2 (etypes 19 & 20): SP800-108 KDF,
+//!   encrypt-then-MAC, string-to-key. [`rc4`] — RFC 4757 RC4-HMAC (etype 23).
+//! - [`der`] + [`types`] + [`messages`] — a hand-rolled X.690 DER codec (total,
+//!   never-panicking decoder) and the RFC 4120 message set (Ticket, AS/TGS
+//!   REQ+REP, KRB-ERROR, PA-DATA). [`client`] assembles AS-REQ / TGS-REQ and
+//!   parses the KDC's reply.
 //!
-//! The Kerberos **ASN.1 message codec** (AS/TGS/AP REQ+REP, PA-DATA, Ticket,
-//! KRB-ERROR) and an **AS-REQ/TGS-REQ client** land next (1.6), at which point
-//! this replaces `picky-krb` inside ADhammer's Kerberos stack. Offensive
-//! compositions (golden/silver/diamond/S4U-abuse/PKINIT-relay) intentionally do
-//! **not** live here — they stay in the ADhammer CLI per its dual-use rule.
+//! This is the crate that replaces `picky-krb` inside ADhammer's Kerberos stack.
+//! Offensive compositions (golden / silver / diamond / S4U-abuse / PKINIT-relay)
+//! intentionally do **not** live here — they stay in the ADhammer CLI per its
+//! dual-use rule.
 //!
-//! See `docs/PLAN_KRB_CRATE.md` in the ADhammer repo for the roadmap.
+//! ## Status
+//! `0.1.x` — the AS/TGS crypto + codec + client are complete and live-validated
+//! (real TGT + service ticket) against Windows Server 2019 / 2022 / 2025. The API
+//! is pre-1.0 and may change: the enctype dispatch is being lifted into a typed
+//! `KerberosKey` abstraction in 0.2.0 (today the TGS-REQ builder targets the
+//! AES-SHA1 session-key profile AD issues; see [`client::build_tgs_req`]).
 
 #![forbid(unsafe_code)]
 

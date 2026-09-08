@@ -1,8 +1,9 @@
 //! etypes 19 & 20 — the RFC 8009 AES-SHA2 Kerberos profiles:
 //! `aes128-cts-hmac-sha256-128` (19) and `aes256-cts-hmac-sha384-192` (20).
 //!
-//! This is the novel part of the crate: almost no Rust library implements RFC 8009
-//! from scratch, and Windows Server 2022+ negotiates these enctypes. Unlike the
+//! Few Rust libraries implement RFC 8009 from scratch. On Windows, MS-KILE adds
+//! these enctypes in **Server 2025 / Windows 11 24H2** (disabled by default);
+//! MIT krb5, Heimdal and Samba negotiate them today. Unlike the
 //! RFC 3961 profiles, key derivation here is the **NIST SP800-108 KDF in counter
 //! mode** (not DR/DK/n-fold), and message protection is genuine **encrypt-then-MAC**
 //! with HMAC-SHA-256/384 over `IV || ciphertext`.

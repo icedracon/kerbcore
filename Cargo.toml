@@ -1,20 +1,18 @@
 [package]
 name = "kerbcore"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "Pure-Rust Kerberos: full etype crypto (AES-SHA1/SHA2 + RC4, RFC 3961/3962/8009/4757) + DER/RFC 4120 codec + AS/TGS client. No FFI, no host krb5."
 keywords = ["kerberos", "rfc3961", "rfc3962", "authentication", "crypto"]
 categories = ["cryptography", "authentication", "parser-implementations"]
-repository = "https://github.com/icedracon/kerbcore"
 readme = "README.md"
 
 # STATUS: crypto + DER/RFC4120 codec + AS/TGS client complete; live-validated AS+TGS
-# vs Server 2019/2022/2025; DER decoder fuzz-clean (71M runs). Publishing `0.1.0-alpha.1`
-# (unstable API — prod after a lot more review). `publish = false` is flipped to true
-# ONLY at the moment of an explicit, per-instance publish order (`--dry-run` first).
-publish = false
+# vs Server 2019/2022/2025; total DER decoder fuzz-clean (6.4B runs). First public
+# release `0.1.0`: API is pre-1.0 and may change (typed-key enctype dispatch lands
+# in 0.2.0). No GitHub mirror yet — `repository` returns once icedracon/kerbcore exists.
 
 [dependencies]
 # RFC 3962 AES-CTS uses the block-level API only; CBC + CTS wrap is hand-rolled.
@@ -26,6 +24,8 @@ md4 = "0.10"
 md-5 = "0.10"
 # etypes 19/20 (RFC 8009 AES-SHA2): SP800-108 KDF + HMAC-SHA-256/384.
 sha2 = "0.10"
+# OS CSPRNG for the TGS-REQ authenticator confounder (must be unpredictable).
+getrandom = "0.2"
 
 [dev-dependencies]
 # Differential oracles — dev-only, NEVER runtime deps (the whole point of

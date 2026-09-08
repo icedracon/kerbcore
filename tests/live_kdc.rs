@@ -185,14 +185,22 @@ fn live_as_exchange() {
     );
     let resp3 = kdc_exchange(&target, &tgs);
     if let Ok(e) = KrbError::decode(&resp3) {
-        panic!("stage 3: TGS-REQ rejected with KRB-ERROR code {}", e.error_code);
+        panic!(
+            "stage 3: TGS-REQ rejected with KRB-ERROR code {}",
+            e.error_code
+        );
     }
     let tgs_rep = KdcRep::decode(&resp3).expect("stage 3: expected TGS-REP");
     assert_eq!(tgs_rep.msg_type, 13);
     // Decrypt the TGS-REP enc-part with the TGT session key at usage 8.
-    let tgs_plain = decrypt_message(&session_key.keyvalue, KU_TGS_REP_ENC_PART, &tgs_rep.enc_part.cipher)
-        .expect("stage 3: decrypt TGS-REP enc-part");
-    let svc_key = enc_kdc_rep_part_session_key(&tgs_plain).expect("parse EncTGSRepPart session key");
+    let tgs_plain = decrypt_message(
+        &session_key.keyvalue,
+        KU_TGS_REP_ENC_PART,
+        &tgs_rep.enc_part.cipher,
+    )
+    .expect("stage 3: decrypt TGS-REP enc-part");
+    let svc_key =
+        enc_kdc_rep_part_session_key(&tgs_plain).expect("parse EncTGSRepPart session key");
     eprintln!(
         "stage 3 OK — TGS-REP; service ticket for {:?}, service session key etype {} ({} bytes). FULL AS+TGS EXCHANGE VALIDATED.",
         tgs_rep.ticket.sname.name_string, svc_key.keytype, svc_key.keyvalue.len()
