@@ -7,9 +7,9 @@
 //! sockets. Parsers are total: malformed input returns [`GssError`], never a panic.
 //!
 //! Coverage: initial-context-token framing (AP-REQ/AP-REP/KRB-ERROR), MIC tokens
-//! (TOK_ID `04 04`), and Wrap tokens **with confidentiality** (TOK_ID `05 04`, `Sealed`).
-//! Integrity-only Wrap (`Sealed`=0) and DCE-style tokens are deliberately out of scope for
-//! now (see the crate roadmap).
+//! (TOK_ID `04 04`), and Wrap tokens (TOK_ID `05 04`) in **both** modes — with confidentiality
+//! ([`wrap`], `Sealed`) and **integrity-only** ([`wrap_integrity`], `Sealed`=0). DCE-style
+//! per-message tokens remain out of scope for now (see the crate roadmap).
 
 use crate::keys::{KerberosKey, KeyError};
 
@@ -210,6 +210,38 @@ pub fn wrap(
     out
 }
 
+/// Produce an **integrity-only Wrap token** (RFC 4121 §4.2.6.2, `Sealed` NOT set): the plaintext
+/// travels in the clear followed by a Kerberos checksum over `plaintext || header`. `EC` carries
+/// the checksum length so the receiver can split it back off; `RRC = 0`. Use when the context
+/// negotiated integrity without confidentiality. [`unwrap`] handles both this and the sealed form.
+pub fn wrap_integrity(
+    key: &KerberosKey,
+    seq: u64,
+    plaintext: &[u8],
+    is_acceptor: bool,
+    acceptor_subkey: bool,
+) -> Vec<u8> {
+    let mut flags = 0u8; // Sealed NOT set
+    if is_acceptor {
+        flags |= FLAG_SENT_BY_ACCEPTOR;
+    }
+    if acceptor_subkey {
+        flags |= FLAG_ACCEPTOR_SUBKEY;
+    }
+    // The checksum length is fixed per enctype; EC records it so unwrap can split the trailer.
+    let ec = key.checksum(sign_usage(is_acceptor), &[]).len();
+    let h = header(TOK_ID_WRAP, flags, ec as u16, 0, seq);
+    let mut to_sign = Vec::with_capacity(plaintext.len() + 16);
+    to_sign.extend_from_slice(plaintext);
+    to_sign.extend_from_slice(&h);
+    let cksum = key.checksum(sign_usage(is_acceptor), &to_sign);
+    let mut out = Vec::with_capacity(16 + plaintext.len() + cksum.len());
+    out.extend_from_slice(&h);
+    out.extend_from_slice(plaintext);
+    out.extend_from_slice(&cksum);
+    out
+}
+
 /// Unwrap a **Wrap token with confidentiality**, returning the recovered plaintext. Handles a
 /// non-zero `RRC` (rotates the body left before decrypting) and `EC` filler, and verifies the
 /// decrypted trailing header matches the token header (with RRC/flags reset) — tamper-evident.
@@ -221,15 +253,33 @@ pub fn unwrap(key: &KerberosKey, token: &[u8]) -> Result<Vec<u8>, GssError> {
         return Err(GssError::WrongTokId([token[0], token[1]]));
     }
     let flags = token[2];
-    if flags & FLAG_SEALED == 0 {
-        // Integrity-only Wrap not supported yet.
-        return Err(GssError::BadToken);
-    }
     let sender_is_acceptor = flags & FLAG_SENT_BY_ACCEPTOR != 0;
     let ec = u16::from_be_bytes([token[4], token[5]]) as usize;
     let rrc = u16::from_be_bytes([token[6], token[7]]) as usize;
-
     let body = &token[16..];
+
+    if flags & FLAG_SEALED == 0 {
+        // Integrity-only: un-rotated body = plaintext || checksum, with EC = checksum length.
+        let data = rotate_left(body, rrc);
+        if data.len() < ec {
+            return Err(GssError::BadHeader);
+        }
+        let (plaintext, got_cksum) = data.split_at(data.len() - ec);
+        // Recompute over plaintext || header(EC as sent, RRC = 0).
+        let mut h0 = [0u8; 16];
+        h0.copy_from_slice(&token[..16]);
+        h0[6] = 0;
+        h0[7] = 0;
+        let mut to_sign = Vec::with_capacity(plaintext.len() + 16);
+        to_sign.extend_from_slice(plaintext);
+        to_sign.extend_from_slice(&h0);
+        let expect = key.checksum(sign_usage(sender_is_acceptor), &to_sign);
+        if !ct_eq(&expect, got_cksum) {
+            return Err(GssError::BadMic);
+        }
+        return Ok(plaintext.to_vec());
+    }
+
     let cipher = rotate_left(body, rrc);
     let plain = key.decrypt(seal_usage(sender_is_acceptor), &cipher)?;
     // plain = plaintext || EC filler || header(16)
@@ -405,6 +455,45 @@ mod tests {
         assert_eq!(tok[2] & FLAG_SEALED, FLAG_SEALED);
         let out = unwrap(&k, &tok).unwrap();
         assert_eq!(out, msg);
+    }
+
+    #[test]
+    fn wrap_integrity_round_trip_plaintext_visible() {
+        let k = key();
+        let msg = b"integrity-only: cleartext + trailing checksum";
+        let tok = wrap_integrity(&k, 7, msg, false, false);
+        assert_eq!(&tok[0..2], &TOK_ID_WRAP);
+        assert_eq!(tok[2] & FLAG_SEALED, 0, "Sealed must NOT be set");
+        // Integrity-only leaves the plaintext readable in the token body.
+        assert!(
+            tok.windows(msg.len()).any(|w| w == msg),
+            "plaintext should be visible in an integrity-only token"
+        );
+        assert_eq!(unwrap(&k, &tok).unwrap(), msg);
+    }
+
+    #[test]
+    fn wrap_integrity_detects_tampering() {
+        let k = key();
+        let tok = wrap_integrity(&k, 1, b"transfer 100 to alice", false, false);
+        // Flip a plaintext byte in the body -> checksum fails.
+        let mut bad = tok.clone();
+        bad[20] ^= 0x01;
+        assert_eq!(unwrap(&k, &bad), Err(GssError::BadMic));
+    }
+
+    #[test]
+    fn wrap_integrity_handles_nonzero_rrc() {
+        // Hand-rotate the integrity body right by RRC and set the field; unwrap must recover it.
+        let k = key();
+        let msg = b"rotate the integrity body";
+        let mut tok = wrap_integrity(&k, 9, msg, true, false);
+        let rrc = 5u16;
+        let body = tok.split_off(16);
+        let rotated = rotate_right(&body, rrc as usize);
+        tok[6..8].copy_from_slice(&rrc.to_be_bytes());
+        tok.extend_from_slice(&rotated);
+        assert_eq!(unwrap(&k, &tok).unwrap(), msg);
     }
 
     #[test]
