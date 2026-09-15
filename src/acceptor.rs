@@ -279,6 +279,21 @@ pub enum AcceptorError {
     /// The authenticator ciphertext did not decrypt cleanly under the supplied
     /// session key (integrity check failed OR the wrong key was used).
     Decrypt(&'static str),
+    /// The ticket ciphertext did not decrypt cleanly under the service key.
+    TicketDecrypt(&'static str),
+    /// The decrypted ticket plaintext did not parse as `EncTicketPart`.
+    BadTicket(DerError),
+    /// Ticket `endtime` is at or before `now_secs`.
+    TicketExpired {
+        /// The ticket's `endtime` (Kerberos generalized-time).
+        endtime: String,
+        /// Server-provided `now` in Unix seconds.
+        now_secs: u64,
+    },
+    /// Authenticator `(crealm, cname)` did not match the ticket `(crealm, cname)`.
+    /// RFC 4120 §3.2.3 — the authenticator MUST bind to the same principal the
+    /// ticket was issued to.
+    PrincipalMismatch,
     /// The decrypted plaintext did not parse as `Authenticator`.
     BadAuthenticator(DerError),
     /// `ctime` was outside `now ± clock_skew_seconds`. Prevents a stale
@@ -302,6 +317,14 @@ impl std::fmt::Display for AcceptorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AcceptorError::Decrypt(s) => write!(f, "authenticator decrypt failed: {s}"),
+            AcceptorError::TicketDecrypt(s) => write!(f, "ticket decrypt failed: {s}"),
+            AcceptorError::BadTicket(e) => write!(f, "ticket parse: {e:?}"),
+            AcceptorError::TicketExpired { endtime, now_secs } => {
+                write!(f, "ticket endtime {endtime} <= now={now_secs}")
+            }
+            AcceptorError::PrincipalMismatch => {
+                write!(f, "authenticator principal does not match ticket principal")
+            }
             AcceptorError::BadAuthenticator(e) => write!(f, "authenticator parse: {e:?}"),
             AcceptorError::ClockSkewExceeded {
                 ctime,
@@ -439,6 +462,256 @@ fn read_i32(der: &[u8]) -> Result<i32, DerError> {
     let n = r.read_integer()?;
     r.finish()?;
     i32::try_from(n).map_err(|_| DerError::IntTooLarge)
+}
+
+// ── EncTicketPart + full ticket decrypt ─────────────────────────────────────
+
+/// Key usage — `Ticket` `EncryptedData.cipher`. RFC 4120 §5.4.1: the
+/// `EncTicketPart` inside a ticket is encrypted under the service's long-term
+/// key at key usage 2.
+pub const KU_TICKET: u32 = 2;
+
+/// Parsed `[APPLICATION 3] EncTicketPart` — the ticket plaintext. RFC 4120 §5.3.
+///
+/// The `caddr` and `transited` fields are not surfaced here (rarely populated
+/// in modern deployments; the acceptor cares about the session key, principal,
+/// and endtime). `authorization_data` is exposed as raw DER for PAC extraction:
+/// the WIN2K-PAC (`ad_type = 128`) sits inside the AD-IF-RELEVANT container per
+/// MS-PAC §2.6, which downstream code can walk.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncTicketPart {
+    /// 32-bit `TicketFlags` value (FORWARDABLE, RENEWABLE, INVALID, HW-AUTH, …).
+    pub flags: u32,
+    /// The session key the KDC issued for this ticket — the whole reason to
+    /// decrypt the ticket. Feed this to [`verify_ap_req`] to unlock the
+    /// authenticator.
+    pub key: EncryptionKey,
+    /// Client realm.
+    pub crealm: String,
+    /// Client principal name.
+    pub cname: PrincipalName,
+    /// Ticket authentication time (Kerberos generalized-time).
+    pub authtime: String,
+    /// Optional earliest-use time (usually equal to authtime).
+    pub starttime: Option<String>,
+    /// Ticket expiry.
+    pub endtime: String,
+    /// Optional renewal deadline.
+    pub renew_till: Option<String>,
+    /// Optional raw `AuthorizationData` DER (SEQUENCE OF SEQUENCE { ad-type, ad-data }).
+    /// Contains the Windows PAC on MS-KILE. Empty vec when absent.
+    pub authorization_data: Vec<u8>,
+}
+
+/// Parse a decrypted `[APPLICATION 3] EncTicketPart`. Total: malformed input
+/// errors.
+pub fn parse_enc_ticket_part(plaintext: &[u8]) -> Result<EncTicketPart, DerError> {
+    let mut r = Der::new(plaintext);
+    let (tag, inner) = r.read_tlv()?;
+    if tag != application_tag(3) {
+        return Err(DerError::TagMismatch {
+            expected: application_tag(3),
+            found: tag,
+        });
+    }
+    let seq = one_or(inner, TAG_SEQUENCE)?;
+    let mut sr = Der::new(seq);
+    // [0] flags — TicketFlags is a KerberosFlags BIT STRING (1 unused-bits octet + 4 flag octets big-endian).
+    let flags_bytes = one_or(sr.expect(context_tag(0))?, TAG_BIT_STRING)?;
+    if flags_bytes.len() < 5 {
+        return Err(DerError::Truncated);
+    }
+    let flags = u32::from_be_bytes([
+        flags_bytes[1],
+        flags_bytes[2],
+        flags_bytes[3],
+        flags_bytes[4],
+    ]);
+    // [1] key — EncryptionKey
+    let key = EncryptionKey::decode(sr.expect(context_tag(1))?)?;
+    // [2] crealm — Realm
+    let crealm = crate::types::decode_realm(sr.expect(context_tag(2))?)?;
+    // [3] cname — PrincipalName
+    let cname = PrincipalName::decode(sr.expect(context_tag(3))?)?;
+    // [4] transited — skip (raw)
+    let _transited = sr.expect(context_tag(4))?;
+    // [5] authtime
+    let authtime = KerberosTime::decode(sr.expect(context_tag(5))?)?.0;
+    // [6] starttime OPTIONAL
+    let starttime = if sr.peek_tag() == Some(context_tag(6)) {
+        Some(KerberosTime::decode(sr.expect(context_tag(6))?)?.0)
+    } else {
+        None
+    };
+    // [7] endtime
+    let endtime = KerberosTime::decode(sr.expect(context_tag(7))?)?.0;
+    // [8] renew-till OPTIONAL
+    let renew_till = if sr.peek_tag() == Some(context_tag(8)) {
+        Some(KerberosTime::decode(sr.expect(context_tag(8))?)?.0)
+    } else {
+        None
+    };
+    // [9] caddr OPTIONAL — skip
+    if sr.peek_tag() == Some(context_tag(9)) {
+        let _ = sr.expect(context_tag(9))?;
+    }
+    // [10] authorization-data OPTIONAL — raw passthrough
+    let authorization_data = if sr.peek_tag() == Some(context_tag(10)) {
+        sr.expect(context_tag(10))?.to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(EncTicketPart {
+        flags,
+        key,
+        crealm,
+        cname,
+        authtime,
+        starttime,
+        endtime,
+        renew_till,
+        authorization_data,
+    })
+}
+
+/// Decrypt `ap_req.ticket.enc_part.cipher` with the service's long-term key
+/// (key usage 2 = [`KU_TICKET`]) and parse the resulting `EncTicketPart`.
+///
+/// This is the first step of a full acceptor: the extracted session key is
+/// then fed to [`verify_ap_req`] to unlock the authenticator.
+pub fn decrypt_ticket(
+    ap_req: &ApReq,
+    service_key: &KerberosKey,
+) -> Result<EncTicketPart, AcceptorError> {
+    let plaintext = service_key
+        .decrypt(KU_TICKET, &ap_req.ticket.enc_part.cipher)
+        .map_err(|_| AcceptorError::TicketDecrypt("service key rejected ticket ciphertext"))?;
+    parse_enc_ticket_part(&plaintext).map_err(AcceptorError::BadTicket)
+}
+
+/// Full acceptor pipeline — the "no caller-supplied session key required"
+/// variant. Decrypts the ticket with `service_key`, then unlocks the
+/// authenticator with the ticket's session key, then does clock-skew + replay.
+///
+/// Bindings enforced (RFC 4120 §3.2.3):
+/// - `authenticator.(crealm, cname)` must equal `enc_ticket.(crealm, cname)`.
+/// - `enc_ticket.endtime` must be strictly after `now_secs`.
+///
+/// Returns the [`AuthContext`] on success — same shape as [`verify_ap_req`]
+/// but the pipeline chose the session key itself.
+pub fn verify_ap_req_full<C: ReplayCache>(
+    ap_req: &ApReq,
+    service_key: &KerberosKey,
+    clock_skew_seconds: u64,
+    now_secs: u64,
+    replay_cache: &mut C,
+) -> Result<(AuthContext, EncTicketPart), AcceptorError> {
+    let enc_ticket = decrypt_ticket(ap_req, service_key)?;
+
+    // Ticket endtime must be in the future.
+    let endtime_secs = parse_kerberos_time(&enc_ticket.endtime)
+        .ok_or_else(|| AcceptorError::BadClientTime(enc_ticket.endtime.clone()))?;
+    if endtime_secs <= now_secs {
+        return Err(AcceptorError::TicketExpired {
+            endtime: enc_ticket.endtime.clone(),
+            now_secs,
+        });
+    }
+
+    // Build a KerberosKey from the session key stored in the ticket.
+    let session = KerberosKey::from_i32(enc_ticket.key.keytype, enc_ticket.key.keyvalue.clone())
+        .map_err(AcceptorError::from)?;
+
+    // Run the existing authenticator pipeline.
+    let ctx = verify_ap_req(ap_req, &session, clock_skew_seconds, now_secs, replay_cache)?;
+
+    // Bind check — authenticator's (crealm, cname) MUST match the ticket's.
+    if ctx.client_realm != enc_ticket.crealm || ctx.client_principal != enc_ticket.cname {
+        return Err(AcceptorError::PrincipalMismatch);
+    }
+
+    Ok((ctx, enc_ticket))
+}
+
+// ── AP-REP builder ──────────────────────────────────────────────────────────
+
+/// Build a mutual-auth `AP-REP` (RFC 4120 §5.5.2) as the service's response to
+/// an AP-REQ carrying `AP_OPTS_MUTUAL_REQUIRED`. Echoes the authenticator's
+/// `(ctime, cusec)` back to the client (encrypted under the ticket session key
+/// at key usage 12) so the client can confirm the service could actually read
+/// its authenticator — i.e., holds the ticket session key.
+///
+/// `subkey` and `seq_number`, when supplied, negotiate a service-chosen
+/// per-message key + starting sequence for the subsequent GSS-Wrap traffic.
+///
+/// **Deterministic-confounder variant**: `confounder` is passed in for tests.
+/// The confounder length MUST equal the session key's confounder length
+/// (`session_key.enctype().confounder_len()` — 16 for the AES profiles, 8 for
+/// RC4). In production the caller fills it from OS CSPRNG; a helper
+/// [`build_ap_rep`] with a fresh confounder is offered below.
+pub fn build_ap_rep_with_confounder(
+    session_key: &KerberosKey,
+    client_authenticator: &Authenticator,
+    subkey: Option<&EncryptionKey>,
+    seq_number: Option<u32>,
+    confounder: &[u8],
+) -> Vec<u8> {
+    use crate::client::KU_AP_REP_ENC_PART;
+    use crate::der::{encode_integer, encode_sequence, explicit, tlv};
+
+    // EncAPRepPart ::= [APPLICATION 27] SEQUENCE {
+    //     ctime [0] KerberosTime, cusec [1] Microseconds,
+    //     subkey [2] EncryptionKey OPTIONAL, seq-number [3] UInt32 OPTIONAL }
+    let mut inner = explicit(0, &KerberosTime(client_authenticator.ctime.clone()).encode());
+    inner.extend_from_slice(&explicit(
+        1,
+        &encode_integer(client_authenticator.cusec as i64),
+    ));
+    if let Some(sk) = subkey {
+        inner.extend_from_slice(&explicit(2, &sk.encode()));
+    }
+    if let Some(n) = seq_number {
+        inner.extend_from_slice(&explicit(3, &encode_integer(n as i64)));
+    }
+    let enc_ap_rep_part = tlv(application_tag(27), &encode_sequence(&inner));
+
+    // Encrypt under the ticket session key at usage 12.
+    let cipher = session_key.encrypt_with_confounder(
+        KU_AP_REP_ENC_PART,
+        confounder,
+        &enc_ap_rep_part,
+    );
+    let enc_part = EncryptedData {
+        etype: session_key.enctype().to_i32(),
+        kvno: None,
+        cipher,
+    };
+
+    // AP-REP ::= [APPLICATION 15] SEQUENCE { pvno [0] INTEGER(5), msg-type [1] INTEGER(15),
+    //     enc-part [2] EncryptedData }
+    let body = [
+        explicit(0, &encode_integer(5)),
+        explicit(1, &encode_integer(15)),
+        explicit(2, &enc_part.encode()),
+    ]
+    .concat();
+    tlv(application_tag(15), &encode_sequence(&body))
+}
+
+/// Build an AP-REP with a fresh OS-CSPRNG confounder — the production path.
+/// See [`build_ap_rep_with_confounder`] for the deterministic-confounder
+/// variant used in tests.
+pub fn build_ap_rep(
+    session_key: &KerberosKey,
+    client_authenticator: &Authenticator,
+    subkey: Option<&EncryptionKey>,
+    seq_number: Option<u32>,
+) -> Vec<u8> {
+    let mut conf = vec![0u8; session_key.enctype().confounder_len()];
+    getrandom::getrandom(&mut conf)
+        .expect("OS CSPRNG available for AP-REP confounder");
+    build_ap_rep_with_confounder(session_key, client_authenticator, subkey, seq_number, &conf)
 }
 
 #[cfg(test)]
@@ -580,5 +853,212 @@ mod tests {
         assert!(parse_kerberos_time("20260132120000Z").is_none()); // day 32
         assert!(parse_kerberos_time("20260101120000").is_none()); // no Z
         assert!(parse_kerberos_time("XXXX0101120000Z").is_none()); // non-digit
+    }
+
+    // ── EncTicketPart + verify_ap_req_full + AP-REP tests ─────────────────
+
+    /// Encode a synthetic EncTicketPart for `alice@CORP.LOCAL` with the given
+    /// endtime and session key, then encrypt it under `service_key` at
+    /// KU_TICKET so parse+decrypt round-trips.
+    fn synth_enc_ticket_part(
+        session_key: &EncryptionKey,
+        crealm: &str,
+        cname: &PrincipalName,
+        authtime: &str,
+        endtime: &str,
+    ) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_sequence, explicit, tlv};
+        use crate::types::encode_realm;
+        let _ = encode_integer;
+        // flags [0] BIT STRING — 0x40000000 = FORWARDABLE (any nonzero pattern OK).
+        let mut flags_bytes = vec![0u8]; // unused-bits
+        flags_bytes.extend_from_slice(&0x4000_0000u32.to_be_bytes());
+        let flags = explicit(0, &tlv(TAG_BIT_STRING, &flags_bytes));
+        let key = explicit(1, &session_key.encode());
+        let crealm = explicit(2, &encode_realm(crealm));
+        let cname_der = explicit(3, &cname.encode());
+        // transited [4] TransitedEncoding ::= SEQUENCE { tr-type [0] Int32, contents [1] OCTET STRING }
+        let tr_body = [
+            explicit(0, &crate::der::encode_integer(0)),
+            explicit(1, &crate::der::encode_octet_string(&[])),
+        ]
+        .concat();
+        let transited = explicit(4, &encode_sequence(&tr_body));
+        let authtime = explicit(5, &KerberosTime(authtime.to_string()).encode());
+        let endtime = explicit(7, &KerberosTime(endtime.to_string()).encode());
+        let inner: Vec<u8> = [flags, key, crealm, cname_der, transited, authtime, endtime]
+            .concat();
+        tlv(application_tag(3), &encode_sequence(&inner))
+    }
+
+    /// Full round-trip AP-REQ builder that puts a real encrypted ticket in
+    /// the AP-REQ (unlike `make_ap_req` which uses opaque cipher bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn make_ap_req_full(
+        service_key: &KerberosKey,
+        session_key: &KerberosKey,
+        crealm: &str,
+        cname: &PrincipalName,
+        ctime: &str,
+        cusec: i32,
+        authtime: &str,
+        endtime: &str,
+    ) -> Vec<u8> {
+        // Session key exposed as its wire EncryptionKey.
+        let session_wire = EncryptionKey {
+            keytype: session_key.enctype().to_i32(),
+            keyvalue: session_key.key().to_vec(),
+        };
+        // Build EncTicketPart plaintext, encrypt under the service key at KU_TICKET.
+        let etp_plain = synth_enc_ticket_part(&session_wire, crealm, cname, authtime, endtime);
+        let ticket_cipher =
+            service_key.encrypt_with_confounder(KU_TICKET, &[0u8; 16], &etp_plain);
+        let ticket = Ticket {
+            tkt_vno: 5,
+            realm: crealm.into(),
+            sname: PrincipalName {
+                name_type: 2,
+                name_string: vec!["HTTP".into(), "web.corp.local".into()],
+            },
+            enc_part: EncryptedData {
+                etype: service_key.enctype().to_i32(),
+                kvno: None,
+                cipher: ticket_cipher,
+            },
+        };
+        build_ap_req_with_confounder(
+            &ticket,
+            session_key,
+            crealm,
+            cname,
+            ctime,
+            cusec,
+            AP_OPTS_MUTUAL_REQUIRED,
+            None,
+            None,
+            None,
+            &[0u8; 16],
+        )
+    }
+
+    #[test]
+    fn full_acceptor_end_to_end_happy_path() {
+        let service_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x11u8; 32]).unwrap();
+        let session_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x22u8; 32]).unwrap();
+        let cname = PrincipalName {
+            name_type: 1,
+            name_string: vec!["alice".into()],
+        };
+        // now = 2026-01-01T12:00:00Z; ctime = now; ticket endtime = 10h later.
+        let now: u64 = 1_767_268_800;
+        let der = make_ap_req_full(
+            &service_key,
+            &session_key,
+            "CORP.LOCAL",
+            &cname,
+            "20260101120000Z",
+            0,
+            "20260101120000Z",
+            "20260101220000Z",
+        );
+        let ap = parse_ap_req(&der).unwrap();
+        let mut cache = HashSetReplayCache::new();
+        let (ctx, etp) = verify_ap_req_full(&ap, &service_key, 300, now, &mut cache).unwrap();
+        assert_eq!(ctx.client_principal.name_string, vec!["alice".to_string()]);
+        assert_eq!(etp.crealm, "CORP.LOCAL");
+        assert_eq!(etp.flags & 0x4000_0000, 0x4000_0000, "FORWARDABLE bit set");
+        assert!(cache.len() == 1);
+    }
+
+    #[test]
+    fn full_acceptor_rejects_expired_ticket() {
+        let service_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x11u8; 32]).unwrap();
+        let session_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x22u8; 32]).unwrap();
+        let cname = PrincipalName {
+            name_type: 1,
+            name_string: vec!["alice".into()],
+        };
+        let now: u64 = 1_767_268_800;
+        // Ticket endtime BEFORE now.
+        let der = make_ap_req_full(
+            &service_key,
+            &session_key,
+            "CORP.LOCAL",
+            &cname,
+            "20260101110000Z", // ctime — still within skew (1 hour before now)
+            0,
+            "20260101100000Z",
+            "20260101110000Z", // endtime = now - 3600
+        );
+        let ap = parse_ap_req(&der).unwrap();
+        let mut cache = HashSetReplayCache::new();
+        // Skew needs to be wide enough to accept the ctime (else fails on skew instead).
+        let err = verify_ap_req_full(&ap, &service_key, 7200, now, &mut cache).unwrap_err();
+        assert!(matches!(err, AcceptorError::TicketExpired { .. }));
+    }
+
+    #[test]
+    fn full_acceptor_rejects_wrong_service_key() {
+        let service_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x11u8; 32]).unwrap();
+        let wrong_service_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0xffu8; 32]).unwrap();
+        let session_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x22u8; 32]).unwrap();
+        let cname = PrincipalName {
+            name_type: 1,
+            name_string: vec!["alice".into()],
+        };
+        let now: u64 = 1_767_268_800;
+        let der = make_ap_req_full(
+            &service_key,
+            &session_key,
+            "CORP.LOCAL",
+            &cname,
+            "20260101120000Z",
+            0,
+            "20260101120000Z",
+            "20260101220000Z",
+        );
+        let ap = parse_ap_req(&der).unwrap();
+        let mut cache = HashSetReplayCache::new();
+        let err =
+            verify_ap_req_full(&ap, &wrong_service_key, 300, now, &mut cache).unwrap_err();
+        assert!(matches!(err, AcceptorError::TicketDecrypt(_)));
+    }
+
+    #[test]
+    fn ap_rep_round_trips_ctime_cusec() {
+        use crate::client::{parse_ap_rep, parse_enc_ap_rep_part, KU_AP_REP_ENC_PART};
+        let session_key =
+            KerberosKey::new(Enctype::Aes256CtsHmacSha1_96, vec![0x33u8; 32]).unwrap();
+        let auth = Authenticator {
+            authenticator_vno: 5,
+            crealm: "CORP.LOCAL".into(),
+            cname: PrincipalName {
+                name_type: 1,
+                name_string: vec!["alice".into()],
+            },
+            cksum: None,
+            cusec: 12345,
+            ctime: "20260101120000Z".into(),
+            subkey: None,
+            seq_number: None,
+        };
+        let der =
+            build_ap_rep_with_confounder(&session_key, &auth, None, Some(42), &[0u8; 16]);
+        let enc = parse_ap_rep(&der).unwrap();
+        let plaintext = session_key
+            .decrypt(KU_AP_REP_ENC_PART, &enc.cipher)
+            .expect("AP-REP decrypt");
+        let part = parse_enc_ap_rep_part(&plaintext).unwrap();
+        assert_eq!(part.ctime, "20260101120000Z");
+        assert_eq!(part.cusec, 12345);
+        assert_eq!(part.seq_number, Some(42));
+        assert!(part.subkey.is_none());
     }
 }
