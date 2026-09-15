@@ -12,18 +12,43 @@ krb5. The crate is pure: bytes in, bytes out. Network I/O stays with the caller.
 
 ```toml
 [dependencies]
-kerbcore = "0.1"
+kerbcore = "0.2"
 ```
 
 Requires Rust 1.88+.
 
 ## Status
 
-Pre-1.0 — the API may change before 0.2.0 (the encryption-type dispatch is moving
-into a typed-key abstraction). The AS/TGS crypto, codec, and client are complete and
-**live-validated end-to-end against Windows Server 2019, 2022, and 2025 KDCs**:
-each obtains a real TGT and service ticket, handling the three different salt schemes
-the servers return (the salt is parsed from the KDC's `ETYPE-INFO2`, never guessed).
+Pre-1.0 — 0.2.x is the current line (typed-key enctype dispatch, AP-REP mutual auth,
+GSS RFC 4121, SPNEGO, FAST, KKDCP, kpasswd, cross-realm referrals). A 0.3.0
+API-freeze candidate is planned before 1.0. The AS/TGS crypto, codec, and client are
+complete and **live-validated end-to-end against Windows Server 2019, 2022, and
+2025 KDCs**: each obtains a real TGT and service ticket, handling the three different
+salt schemes the servers return (the salt is parsed from the KDC's `ETYPE-INFO2`,
+never guessed).
+
+## When to reach for kerbcore (honest table)
+
+Kerbcore covers a specific niche in the Rust Kerberos ecosystem. It is not the right
+choice for everyone; the alternatives are legitimately better for other use cases.
+
+| You want... | Reach for | Why |
+|---|---|---|
+| Kerberos client that just works everywhere your OS runs | [`libgssapi-sys`] | Battle-tested MIT/Heimdal FFI; largest user base; the boring safe default |
+| Windows-native SSPI parity from Rust | [`sspi-rs`] | Real SSPI reimplementation; substantial user base; handles Windows quirks |
+| Just KRB message codec, no client | [`picky-krb`] | Smallest surface; long history; used by sspi-rs internally |
+| Static binary, no libclang at build, no libkrb5 at runtime | **kerbcore** | Zero FFI, zero system deps |
+| Cross-compile to musl / minimal Alpine / embedded | **kerbcore** | Pure-Rust, `#![forbid(unsafe_code)]`, tiny external tree (8 deps) |
+| Wire-level control (roast, forge, inspect PA-data, walk KDC-REP by hand) | **kerbcore** | Types are yours; the codec is total (no panic on hostile input) |
+| Environments where the MIT/Heimdal C audit surface is unacceptable | **kerbcore** | Pure-Rust, no `unsafe` |
+| A production-mature Kerberos crate with a large ecosystem | **not kerbcore yet** | Pre-1.0, small user base — pick libgssapi or sspi-rs |
+
+The pure-Rust-Kerberos-with-no-FFI category is a small niche. Kerbcore's goal is to be
+the honest top of that niche, not to displace libgssapi.
+
+[`libgssapi-sys`]: https://crates.io/crates/libgssapi-sys
+[`sspi-rs`]: https://crates.io/crates/sspi
+[`picky-krb`]: https://crates.io/crates/picky-krb
 
 ## Encryption-type coverage
 
