@@ -50,6 +50,23 @@ the honest top of that niche, not to displace libgssapi.
 [`sspi-rs`]: https://crates.io/crates/sspi
 [`picky-krb`]: https://crates.io/crates/picky-krb
 
+## Examples
+
+Three runnable examples under `examples/`:
+
+- **`get_tgt`** — obtain a real TGT from a live KDC (env-configured), from
+  scratch in ~90 LOC. AS-REQ → KRB-ERROR (salt) → PA-ENC-TIMESTAMP → AS-REP →
+  decrypt session key.
+- **`asrep_roast`** — no-preauth account → hashcat `-m 18200` line. The
+  offline-cracking primitive behind AS-REP roasting, in ~90 LOC and no runtime.
+- **`gss_wrap_unwrap`** — RFC 4121 message protection round-trip (offline,
+  no KDC needed). Shows the post-handshake `Wrap` / `Unwrap` / `GetMIC` /
+  `VerifyMIC` primitives you'd otherwise reach for through libgssapi.
+
+```sh
+cargo run --example gss_wrap_unwrap
+```
+
 ## Encryption-type coverage
 
 The modern Active Directory encryption-type matrix — not a single profile:
