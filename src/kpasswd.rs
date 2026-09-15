@@ -27,6 +27,7 @@ pub const VERSION_CHANGE_PASSWD: u16 = 0x0001;
 pub const VERSION_SET_PASSWD: u16 = 0xFF80;
 
 /// Errors from the kpasswd/KRB-PRIV codecs.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KpasswdError {
     /// Malformed container / DER, or a length field that overruns the buffer.

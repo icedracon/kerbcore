@@ -15,6 +15,7 @@ use crate::der::{
 use crate::types::{decode_realm, encode_realm};
 
 /// KKDCP container errors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KkdcpError {
     /// Structurally invalid container, bad DER, or a length prefix that overruns the buffer.

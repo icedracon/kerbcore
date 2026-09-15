@@ -512,6 +512,58 @@ pub fn referral_realm(
     Some(next)
 }
 
+/// Error from a cross-realm referral chase ([`chase_referrals`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChaseError<E> {
+    /// The KDC referred back to a realm already visited — a trust cycle. Carries the realm.
+    LoopDetected(String),
+    /// The chase exceeded `max_hops` without reaching the service ticket.
+    MaxHopsExceeded(usize),
+    /// The caller's per-hop TGS fetch failed.
+    Fetch(E),
+}
+
+/// Drive a cross-realm TGS **referral chase** (RFC 6806) to completion. Starting in
+/// `start_realm`, repeatedly invoke `fetch(realm)` — which performs ONE TGS exchange for
+/// `target` using the current-realm TGT and returns the decrypted [`EncKdcRepPart`] — and follow
+/// `krbtgt/<next>` referrals until the reply's `sname` is the service you asked for. kerbcore owns
+/// the loop, referral detection ([`referral_realm`]), a visited-set **loop guard**, and a
+/// `max_hops` bound; the caller owns the socket + its own TGT-per-realm handling inside `fetch`.
+///
+/// Returns the ordered realm path traversed (`[start, …, service-realm]`) on success.
+pub fn chase_referrals<F, E>(
+    target: &PrincipalName,
+    start_realm: &str,
+    max_hops: usize,
+    mut fetch: F,
+) -> Result<Vec<String>, ChaseError<E>>
+where
+    F: FnMut(&str) -> Result<EncKdcRepPart, E>,
+{
+    let mut path = vec![start_realm.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(start_realm.to_ascii_uppercase());
+    let mut current = start_realm.to_string();
+
+    for _ in 0..max_hops {
+        let rep = fetch(&current).map_err(ChaseError::Fetch)?;
+        match referral_realm(&rep.sname, target) {
+            // Referral TGT for another realm — hop, guarding against a trust cycle.
+            Some(next) => {
+                if !visited.insert(next.to_ascii_uppercase()) {
+                    return Err(ChaseError::LoopDetected(next));
+                }
+                path.push(next.clone());
+                current = next;
+            }
+            // The reply is the service ticket — chase complete.
+            None => return Ok(path),
+        }
+    }
+    Err(ChaseError::MaxHopsExceeded(max_hops))
+}
+
 /// Build a TGS-REQ that **renews** a renewable TGT (RFC 4120 §3.3 credential lifecycle): the
 /// RENEW option is set, the service name is `krbtgt/<realm>`, and the ticket being renewed is
 /// presented in the PA-TGS-REQ. `till` is the requested new end time (bounded by the ticket's
@@ -953,6 +1005,88 @@ mod tests {
             referral_realm(&krbtgt("b.example.com"), &krbtgt("B.EXAMPLE.COM")),
             None
         );
+    }
+
+    fn rep_with_sname(sname: PrincipalName, srealm: &str) -> EncKdcRepPart {
+        EncKdcRepPart {
+            key: crate::types::EncryptionKey {
+                keytype: 18,
+                keyvalue: vec![0u8; 32],
+            },
+            nonce: 1,
+            endtime: "20260101000000Z".into(),
+            srealm: srealm.into(),
+            sname,
+        }
+    }
+    fn krbtgt_rep(realm: &str) -> EncKdcRepPart {
+        rep_with_sname(
+            PrincipalName {
+                name_type: 2,
+                name_string: vec!["krbtgt".into(), realm.into()],
+            },
+            realm,
+        )
+    }
+
+    #[test]
+    fn chase_follows_referral_chain_to_service() {
+        // A → B → C, service ticket issued in C.
+        let svc = PrincipalName {
+            name_type: 2,
+            name_string: vec!["cifs".into(), "fs.c.example.com".into()],
+        };
+        let hops = [
+            krbtgt_rep("B.EXAMPLE.COM"),                  // fetch(A) → referral to B
+            krbtgt_rep("C.EXAMPLE.COM"),                  // fetch(B) → referral to C
+            rep_with_sname(svc.clone(), "C.EXAMPLE.COM"), // fetch(C) → the service ticket
+        ];
+        let mut i = 0;
+        let path = chase_referrals::<_, ()>(&svc, "A.EXAMPLE.COM", 10, |_realm| {
+            let r = hops[i].clone();
+            i += 1;
+            Ok(r)
+        })
+        .unwrap();
+        assert_eq!(path, ["A.EXAMPLE.COM", "B.EXAMPLE.COM", "C.EXAMPLE.COM"]);
+        assert_eq!(i, 3, "exactly three TGS exchanges");
+    }
+
+    #[test]
+    fn chase_detects_trust_loop() {
+        let svc = PrincipalName {
+            name_type: 2,
+            name_string: vec!["cifs".into(), "x".into()],
+        };
+        // A → B → A (referral cycle).
+        let hops = [krbtgt_rep("B.EXAMPLE.COM"), krbtgt_rep("A.EXAMPLE.COM")];
+        let mut i = 0;
+        let err = chase_referrals::<_, ()>(&svc, "A.EXAMPLE.COM", 10, |_r| {
+            let r = hops[i].clone();
+            i += 1;
+            Ok(r)
+        })
+        .unwrap_err();
+        assert_eq!(err, ChaseError::LoopDetected("A.EXAMPLE.COM".into()));
+    }
+
+    #[test]
+    fn chase_bounds_hops_and_propagates_fetch_error() {
+        let svc = PrincipalName {
+            name_type: 2,
+            name_string: vec!["cifs".into(), "x".into()],
+        };
+        // Endless fresh referrals → MaxHopsExceeded at the bound.
+        let mut n = 0;
+        let err = chase_referrals::<_, ()>(&svc, "R0", 2, |_r| {
+            n += 1;
+            Ok(krbtgt_rep(&format!("R{n}")))
+        })
+        .unwrap_err();
+        assert_eq!(err, ChaseError::MaxHopsExceeded(2));
+        // Fetch error is surfaced verbatim.
+        let err2 = chase_referrals::<_, &str>(&svc, "R0", 5, |_r| Err("network down")).unwrap_err();
+        assert_eq!(err2, ChaseError::Fetch("network down"));
     }
 
     #[test]

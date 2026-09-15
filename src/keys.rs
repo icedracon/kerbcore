@@ -12,7 +12,10 @@ use zeroize::Zeroizing;
 use crate::rfc8009::Rfc8009Etype;
 use crate::{crypto, rc4, rfc8009};
 
-/// The Kerberos encryption types kerbcore implements.
+/// The Kerberos encryption types kerbcore implements. New enctypes (RFC 8009
+/// AES-SHA2 variants, camellia, etc.) may be added in future minor releases —
+/// callers should match with a `_` arm.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Enctype {
     /// 17 — `aes128-cts-hmac-sha1-96` (RFC 3962).

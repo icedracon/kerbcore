@@ -43,6 +43,7 @@ const FLAG_SEALED: u8 = 0x02;
 const FLAG_ACCEPTOR_SUBKEY: u8 = 0x04;
 
 /// Errors from GSS token framing / per-message protection.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GssError {
     /// The token was truncated or otherwise structurally invalid.

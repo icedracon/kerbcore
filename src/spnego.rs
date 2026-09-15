@@ -27,6 +27,7 @@ const TAG_OID: u8 = 0x06;
 const TAG_ENUMERATED: u8 = 0x0A;
 
 /// SPNEGO errors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpnegoError {
     /// Structurally invalid / truncated token, or a DER decode failure.

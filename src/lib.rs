@@ -55,3 +55,115 @@ pub mod types;
 
 pub use crypto::*;
 pub use keys::{Enctype, KerberosKey, KeyError};
+
+/// Umbrella error covering every failure mode kerbcore surfaces. Per-module
+/// errors (`DerError`, `KeyError`, `GssError`, …) are the precise types the
+/// individual APIs return; `KerbError` is what a caller uses at their public
+/// API boundary when they want ONE error type to bubble.
+///
+/// Every module error has a `From` conversion into `KerbError`, so `?` works
+/// across modules without hand-written glue:
+///
+/// ```
+/// use kerbcore::KerbError;
+///
+/// fn parse_and_decrypt() -> Result<Vec<u8>, KerbError> {
+///     let der: &[u8] = &[];
+///     let _ = kerbcore::messages::KrbError::decode(der)?; // DerError -> KerbError
+///     Ok(Vec::new())
+/// }
+/// ```
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum KerbError {
+    /// A DER codec error — malformed / truncated / non-canonical bytes from a
+    /// KDC or peer.
+    Der(der::DerError),
+    /// A key-layer error — wrong-length key, unsupported etype, or decrypt
+    /// integrity/length failure via [`KerberosKey`].
+    Key(keys::KeyError),
+    /// AES-SHA1 authenticated-decrypt failure (raw [`crypto::decrypt_message`]).
+    /// Prefer [`KerberosKey::decrypt`] which surfaces a `KeyError` instead.
+    Decrypt(crypto::DecryptError),
+    /// RC4-HMAC decrypt failure (raw [`rc4::decrypt`]).
+    Rc4(rc4::Rc4Error),
+    /// RFC 8009 (AES-SHA2) decrypt failure (raw [`rfc8009::decrypt`]).
+    Rfc8009(rfc8009::Rfc8009Error),
+    /// GSS per-message protection error (bad token id, MIC mismatch, replay
+    /// window rejection).
+    Gss(gss::GssError),
+    /// SPNEGO negotiation error.
+    Spnego(spnego::SpnegoError),
+    /// FAST armoring error.
+    Fast(fast::FastError),
+    /// KKDCP HTTPS-proxy container error.
+    Kkdcp(kkdcp::KkdcpError),
+    /// kpasswd / KRB-PRIV codec error.
+    Kpasswd(kpasswd::KpasswdError),
+}
+
+impl std::fmt::Display for KerbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KerbError::Der(e) => write!(f, "DER: {e:?}"),
+            KerbError::Key(e) => write!(f, "key: {e:?}"),
+            KerbError::Decrypt(e) => write!(f, "decrypt: {e:?}"),
+            KerbError::Rc4(e) => write!(f, "rc4-hmac: {e:?}"),
+            KerbError::Rfc8009(e) => write!(f, "rfc8009: {e:?}"),
+            KerbError::Gss(e) => write!(f, "gss: {e:?}"),
+            KerbError::Spnego(e) => write!(f, "spnego: {e:?}"),
+            KerbError::Fast(e) => write!(f, "fast: {e:?}"),
+            KerbError::Kkdcp(e) => write!(f, "kkdcp: {e:?}"),
+            KerbError::Kpasswd(e) => write!(f, "kpasswd: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for KerbError {}
+
+macro_rules! from_impl {
+    ($src:path, $variant:ident) => {
+        impl From<$src> for KerbError {
+            fn from(e: $src) -> Self {
+                KerbError::$variant(e)
+            }
+        }
+    };
+}
+from_impl!(der::DerError, Der);
+from_impl!(keys::KeyError, Key);
+from_impl!(crypto::DecryptError, Decrypt);
+from_impl!(rc4::Rc4Error, Rc4);
+from_impl!(rfc8009::Rfc8009Error, Rfc8009);
+from_impl!(gss::GssError, Gss);
+from_impl!(spnego::SpnegoError, Spnego);
+from_impl!(fast::FastError, Fast);
+from_impl!(kkdcp::KkdcpError, Kkdcp);
+from_impl!(kpasswd::KpasswdError, Kpasswd);
+
+#[cfg(test)]
+mod kerb_error_tests {
+    use super::*;
+
+    #[test]
+    fn each_module_error_lifts_via_question_mark() {
+        // Compile-only proof that `?` works from every per-module error into KerbError.
+        fn _f() -> Result<(), KerbError> {
+            Err(der::DerError::Truncated)?
+        }
+        assert!(_f().is_err());
+    }
+
+    #[test]
+    fn display_has_variant_prefix() {
+        let e: KerbError = der::DerError::Truncated.into();
+        let s = format!("{e}");
+        assert!(s.starts_with("DER: "), "unexpected display: {s}");
+    }
+
+    #[test]
+    fn kerb_error_implements_error_trait() {
+        fn _accepts_error<E: std::error::Error>(_: E) {}
+        _accepts_error(KerbError::from(der::DerError::Truncated));
+    }
+}

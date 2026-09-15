@@ -42,6 +42,7 @@ const PEPPER_SUBKEY: &[u8] = b"subkeyarmor";
 const PEPPER_TICKET: &[u8] = b"ticketarmor";
 
 /// FAST errors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FastError {
     /// Malformed / truncated DER.
