@@ -39,6 +39,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acceptor;
 pub mod client;
 pub mod config;
 pub mod crypto;
