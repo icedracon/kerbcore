@@ -67,6 +67,20 @@ Three runnable examples under `examples/`:
 cargo run --example gss_wrap_unwrap
 ```
 
+## Used by
+
+- [`ccache-io`](https://crates.io/crates/ccache-io) — MIT ccache v4 reader/writer.
+  Its `kerbcore` cargo feature bridges `Principal` / `KeyBlock` to
+  `PrincipalName` / `EncryptionKey`, so callers who already speak kerbcore fold
+  ccache I/O in with no manual field-shuffling.
+- [`ms-pac-forge`](https://crates.io/crates/ms-pac-forge) — MS-PAC forge / verify.
+  Uses kerbcore as a differential oracle for the RC4-HMAC path (dev-dependency
+  today; runtime dep after ms-pac-forge's typed-error refactor).
+- [`adhammer`](https://crates.io/crates/adhammer) — AD security assessment CLI.
+  Consumes kerbcore's crypto + codec + client for AS-REP roast, TGS-REP
+  kerberoast, S4U2Self / S4U2Proxy (RBCD), Golden / Silver / Diamond forge, and
+  PKINIT.
+
 ## Encryption-type coverage
 
 The modern Active Directory encryption-type matrix — not a single profile:
